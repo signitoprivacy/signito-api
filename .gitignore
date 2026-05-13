@@ -1,0 +1,27 @@
+# Build
+dist/
+*.js.map
+
+# Dependencies
+node_modules/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*keypair*.json
+
+# Replit
+.replit
+replit.md
+.local/
+
+# TS build info
+*.tsbuildinfo
+
+# Logs
+*.log
+pino-*
+
+# OS
+.DS_Store
