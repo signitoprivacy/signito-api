@@ -2,6 +2,9 @@
 
 Signito API Server — Express 5 backend for the Signito privacy protocol.
 
+**API Base:** [api.signito.org](https://api.signito.org)  
+**Docs:** [docs.signito.org](https://docs.signito.org)
+
 Handles vault metadata, StealthSend commitments, AirSign vouchers, Helius RPC proxying, and the SignitoRelay gasless fee payer.
 
 ---
@@ -11,9 +14,9 @@ Handles vault metadata, StealthSend commitments, AirSign vouchers, Helius RPC pr
 - **SafeVault routes** — initialize, deposit, unshield, vault state queries
 - **StealthSend routes** — commitment storage, nullifier-based withdrawal
 - **AirSign routes** — voucher creation, pending claims, release
-- **SignitoRelay** — in-process gasless fee payer with rate limiting and transaction simulation
+- **SignitoRelay** — gasless fee payer with rate limiting and tx simulation
 - **Helius RPC proxy** — API key never exposed to the browser
-- **OpenAPI 3.1 spec** — `lib/api-spec/openapi.yaml` is the source of truth
+- **OpenAPI 3.1 spec** — `lib/api-spec/openapi.yaml` is the single source of truth
 
 ---
 
@@ -35,7 +38,7 @@ signito-api/
     lib/
       relayer.ts        SignitoRelay keypair, rate limiter, tx simulation
       rpc.ts            Helius RPC connection singleton
-    app.ts              Express app setup, middleware, route mounting
+    app.ts              Express app setup
     index.ts            Server entrypoint
   lib/
     api-spec/
@@ -61,35 +64,34 @@ signito-api/
 
 ## SignitoRelay Trust Model
 
-- Validates fee payer field matches its own public key
-- Simulates every transaction before co-signing
+- Validates fee payer matches its own public key before co-signing
+- Simulates every transaction before signing
 - Rate limits: 10 TX/hr per wallet, 20 TX/hr per IP
-- Only accepts instructions from the Signito program (allowlist enforced)
-- Controls only the fee pool — user funds are protected by on-chain program logic
+- Allowlist: only Signito program instructions accepted
+- Controls only the fee pool — user funds protected by on-chain program logic
 
 ---
 
 ## Getting Started
 
 ```bash
-# Install dependencies
 pnpm install
 
-# Set environment variables
 cp .env.example .env
+# Set DATABASE_URL, HELIUS_API_KEY, RELAY_KEYPAIR, SESSION_SECRET
 
-# Push database schema (requires DATABASE_URL)
+# Push database schema
 pnpm --filter @workspace/db run push
 
-# Start dev server (port 8080)
-pnpm dev
+# Start dev server
+pnpm dev   # → http://localhost:8080
 ```
 
 ## Build for Production
 
 ```bash
 pnpm build
-# Output: dist/index.mjs (ESM CJS bundle via esbuild)
+# Output: dist/index.mjs (ESM bundle via esbuild)
 ```
 
 ---
@@ -99,7 +101,7 @@ pnpm build
 | Variable | Description |
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection string |
-| `HELIUS_API_KEY` | Helius RPC key (get free at helius.dev) |
+| `HELIUS_API_KEY` | Helius RPC key — [helius.dev](https://helius.dev) |
 | `RELAY_KEYPAIR` | Base58 private key for SignitoRelay fee payer |
 | `SESSION_SECRET` | Express session secret |
 | `PORT` | Server port (default: 8080) |
@@ -108,11 +110,21 @@ pnpm build
 
 ## API Codegen
 
-The OpenAPI spec at `lib/api-spec/openapi.yaml` generates React Query hooks and Zod schemas:
-
 ```bash
 pnpm --filter @workspace/api-spec run codegen
+# Generates React Query hooks → lib/api-client-react/
+# Generates Zod schemas    → lib/api-zod/
 ```
+
+---
+
+## Related Repositories
+
+| Repo | Description |
+|---|---|
+| [signito-programs](https://github.com/signitoprivacy/signito-programs) | On-chain Anchor/Rust program |
+| [signito-app](https://github.com/signitoprivacy/signito-app) | Shield dApp frontend |
+| [signito-docs](https://github.com/signitoprivacy/signito-docs) | Protocol documentation |
 
 ---
 
