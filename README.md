@@ -1,9 +1,9 @@
 # signito-api
 
+**Website:** [signito.org](https://signito.org)
+
 Signito API Server — Express 5 backend for the Signito privacy protocol.
 
-**API Base:** [api.signito.org](https://api.signito.org)  
-**Docs:** [docs.signito.org](https://docs.signito.org)
 
 Handles vault metadata, StealthSend commitments, AirSign vouchers, Helius RPC proxying, and the SignitoRelay gasless fee payer.
 
