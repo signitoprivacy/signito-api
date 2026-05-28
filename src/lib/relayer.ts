@@ -14,6 +14,7 @@
 import { Keypair, VersionedTransaction, Connection, PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 import { logger } from "./logger.js";
+import { heliusRpcUrl } from "./rpc.js";
 
 // ─── Keypair ────────────────────────────────────────────────────────────────
 
@@ -47,20 +48,11 @@ export function relayerReady(): boolean {
 // ─── Connection (for simulation + balance) ──────────────────────────────────
 
 export function getRpcUrl(): string {
-  const heliusKey = process.env.HELIUS_API_KEY;
-  const cluster = process.env.SOLANA_CLUSTER ?? "mainnet";
-  if (cluster === "devnet") {
-    return heliusKey
-      ? `https://devnet.helius-rpc.com/?api-key=${heliusKey}`
-      : "https://api.devnet.solana.com";
-  }
-  return heliusKey
-    ? `https://mainnet.helius-rpc.com/?api-key=${heliusKey}`
-    : "https://api.mainnet-beta.solana.com";
+  return heliusRpcUrl();
 }
 
 export function getConnection(): Connection {
-  return new Connection(getRpcUrl(), "confirmed");
+  return new Connection(heliusRpcUrl(), "confirmed");
 }
 
 // ─── Rate Limiter ────────────────────────────────────────────────────────────
@@ -119,7 +111,8 @@ export const ALLOWED_PROGRAMS = new Set<string>([
   "ComputeBudget111111111111111111111111111111",    // Compute Budget
   "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",  // Memo
   "Ed25519SigVerify111111111111111111111111111",    // Ed25519 precompile
-  "9PibgJMUa3zXVd7YWJEJ8UQ14A7z2J3qZ7QDvRW38XeD", // signito_vault (devnet)
+  "5gbaenRHg2YK6X8WMMQZevD55bJ7fvr4V8E8e1feDt5D", // signito_vault (devnet)
+  "HyciDEYB9hXdmmLMexTHv2QYDaJmuZr1AF7sipBbVLLH", // signito_vault (mainnet)
 ]);
 
 // ─── Max fee guard ────────────────────────────────────────────────────────────

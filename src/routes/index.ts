@@ -11,6 +11,9 @@ import vaultBalancesRouter from "./vault_balances";
 import stealthRouter from "./stealth";
 import airsignRouter from "./airsign";
 import relayInfoRouter from "./relay-info";
+import developerRouter from "./developer";
+import mixRouter from "./mix";
+import baseVaultRouter from "./base-vault";
 
 const router: IRouter = Router();
 
@@ -26,5 +29,8 @@ router.use(vaultBalancesRouter);
 router.use(stealthRouter);
 router.use(airsignRouter);
 router.use(relayInfoRouter);
+router.use(developerRouter);
+router.use(mixRouter);
+router.use(baseVaultRouter);
 
 export default router;

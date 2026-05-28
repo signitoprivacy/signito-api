@@ -51,10 +51,14 @@ router.get("/rpc/devnet", (_req, res): void => {
   res.json({ ok: true });
 });
 
-// GET /rpc/cluster -- tells frontend which cluster is active
+// GET /rpc/cluster -- tells frontend which cluster is active and which program ID to use
+const PROGRAM_ID_DEVNET = "5gbaenRHg2YK6X8WMMQZevD55bJ7fvr4V8E8e1feDt5D";
+const PROGRAM_ID_MAINNET = "HyciDEYB9hXdmmLMexTHv2QYDaJmuZr1AF7sipBbVLLH";
+
 router.get("/rpc/cluster", (_req, res): void => {
   const cluster = process.env.SOLANA_CLUSTER ?? "mainnet";
-  res.json({ cluster });
+  const programId = cluster === "devnet" ? PROGRAM_ID_DEVNET : PROGRAM_ID_MAINNET;
+  res.json({ cluster, programId });
 });
 
 export default router;

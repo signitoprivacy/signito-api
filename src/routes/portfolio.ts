@@ -51,6 +51,7 @@ function resolveToken(mint: string): { name: string; symbol: string } {
 }
 
 router.get("/portfolio/:wallet", async (req, res): Promise<void> => {
+  res.set("Cache-Control", "no-store");
   const raw = Array.isArray(req.params.wallet) ? req.params.wallet[0] : req.params.wallet;
   const wallet = raw as string;
   const heliusKey = process.env.HELIUS_API_KEY;

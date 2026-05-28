@@ -1,5 +1,5 @@
 {
-  "name": "signito-api",
+  "name": "@workspace/api-server",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@solana/web3.js": "^1.98.4",
+    "viem": "catalog:",
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",
     "@workspace/program": "workspace:*",
@@ -21,6 +22,7 @@
     "express": "^5",
     "pino": "^9",
     "pino-http": "^10",
+    "tweetnacl": "^1.0.3",
     "zod": "catalog:"
   },
   "devDependencies": {

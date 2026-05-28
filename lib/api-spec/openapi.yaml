@@ -3,13 +3,28 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Signito API - non-custodial transaction privacy on Solana
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: status
+    description: System status checks
+  - name: rpc
+    description: Solana RPC proxy
+  - name: portfolio
+    description: Token portfolio
+  - name: transactions
+    description: Transaction history
+  - name: relay
+    description: SignitoRelay broadcast
+  - name: vault
+    description: SafeVault operations
+  - name: stealth
+    description: StealthSend operations
+
 paths:
   /healthz:
     get:
@@ -24,13 +39,1089 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /status:
+    get:
+      operationId: getStatus
+      tags: [status]
+      summary: System status check
+      description: Server-side health check of Solana RPC and Helius API
+      responses:
+        "200":
+          description: Status result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResult"
+
+  /rpc/mainnet:
+    post:
+      operationId: rpcMainnet
+      tags: [rpc]
+      summary: Proxy to Solana Mainnet RPC
+      description: Proxies JSON-RPC requests to Helius Mainnet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RpcRequest"
+      responses:
+        "200":
+          description: RPC response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RpcResponse"
+
+  /portfolio/{wallet}:
+    get:
+      operationId: getPortfolio
+      tags: [portfolio]
+      summary: Get token portfolio
+      description: Fetch SPL token balances for a wallet via Helius DAS
+      parameters:
+        - name: wallet
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Portfolio response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortfolioResult"
+
+  /transactions/{wallet}:
+    get:
+      operationId: getTransactions
+      tags: [transactions]
+      summary: Get transaction history
+      description: Fetch transaction history for a wallet
+      parameters:
+        - name: wallet
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Transaction list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionListResult"
+
+  /relay/info:
+    get:
+      operationId: getRelayInfo
+      tags: [relay]
+      summary: SignitoRelay info
+      description: Returns the relayer public key, readiness status, and SOL balance. Clients must set fee_payer to feePayer before signing.
+      responses:
+        "200":
+          description: Relay info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelayInfoResult"
+
+  /relay:
+    post:
+      operationId: relay
+      tags: [relay]
+      summary: SignitoRelay broadcast
+      description: Accepts a VersionedTransaction with fee_payer set to SignitoRelay. Server co-signs as fee payer, validates via program allowlist and simulation, then broadcasts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelayInput"
+      responses:
+        "200":
+          description: Relay result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelayResult"
+        "400":
+          description: Validation or simulation error
+        "429":
+          description: Rate limit exceeded (10 TX/hr per wallet)
+
+  /stealth/deposit:
+    post:
+      operationId: stealthDeposit
+      tags: [stealth]
+      summary: Register a StealthSend deposit
+      description: |
+        User sends SOL to the relay wallet on-chain, then calls this to register their commitment.
+        Server verifies the on-chain transfer. Only the commitment (sha256 of nullifier) is stored.
+        The nullifier is never sent to the server until withdrawal.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StealthDepositInput"
+      responses:
+        "200":
+          description: Deposit registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StealthDepositResult"
+        "400":
+          description: Invalid input or on-chain verification failed
+        "503":
+          description: Relay not configured
+
+  /stealth/withdraw:
+    post:
+      operationId: stealthWithdraw
+      tags: [stealth]
+      summary: Withdraw from StealthSend pool
+      description: |
+        Reveal nullifier to withdraw. Server computes sha256(nullifier) to find the deposit,
+        then the relay sends SOL to the recipient from its balance.
+        On-chain: relay wallet to recipient (no direct link to original sender).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StealthWithdrawInput"
+      responses:
+        "200":
+          description: Withdrawal broadcast
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StealthWithdrawResult"
+        "400":
+          description: Invalid nullifier or relay error
+        "404":
+          description: No matching unspent deposit found
+        "503":
+          description: Relay not configured
+
+  /stealth/zk-transfer:
+    post:
+      operationId: stealthZkTransfer
+      tags: [stealth]
+      summary: ZK transfer from shielded vault via relay
+      description: |
+        Proves vault ownership via OTS pre-image (no wallet signature required).
+        Relay builds and broadcasts SOL transfer to recipient using RELAYER_PRIVATE_KEY.
+        On-chain: relay wallet to recipient only. User wallet absent from transaction.
+        OTS chain depth is consumed. sToken balance is decremented.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ZkTransferInput"
+      responses:
+        "200":
+          description: Transfer broadcast by relay
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ZkTransferResult"
+        "400":
+          description: Invalid OTS pre-image or insufficient balance
+        "404":
+          description: Vault not found
+        "503":
+          description: Relay not configured
+
+  /stealth-pending/{wallet}:
+    get:
+      operationId: getStealthPending
+      tags: [stealth]
+      summary: Get pending stealth withdrawals
+      description: Fetch pending stealth withdrawal entries for a wallet
+      parameters:
+        - name: wallet
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Pending stealth withdrawals
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StealthPendingResult"
+
+  /vault-balances/{wallet}:
+    get:
+      operationId: getVaultBalances
+      tags: [vault]
+      summary: Get shielded token balances
+      description: Returns per-token shielded balances for a wallet from DB
+      parameters:
+        - name: wallet
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Vault balances
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultBalancesResult"
+
+  /stats:
+    get:
+      operationId: getPlatformStats
+      tags: [status]
+      summary: Platform statistics
+      description: Returns live aggregate stats from the DB
+      responses:
+        "200":
+          description: Platform stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlatformStats"
+
+  /vault/deposit:
+    post:
+      operationId: vaultDeposit
+      tags: [vault]
+      summary: Record deposit to existing vault
+      description: Records a shield deposit to an existing vault and updates the shielded balance. Call this when the user shields tokens into a vault that already exists.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VaultDepositInput"
+      responses:
+        "200":
+          description: Deposit recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultDepositResult"
+        "404":
+          description: Vault not found
+
+  /vault/create:
+    post:
+      operationId: createVault
+      tags: [vault]
+      summary: Create a SafeVault
+      description: Registers a new vault in the DB. Client derives the OTS hash locally from the vault code and sends only the hash — the vault code never leaves the browser.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateVaultInput"
+      responses:
+        "200":
+          description: Vault created or already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultResult"
+        "400":
+          description: Invalid input
+
+  /vault/unshield:
+    post:
+      operationId: unshieldVault
+      tags: [vault]
+      summary: Unshield tokens from SafeVault
+      description: |
+        Client derives the OTS pre-image locally from the vault code, then submits it here.
+        Server verifies SHA-256(preimage) == stored tip, updates the tip to preimage (consuming one OTS depth level), and queues the on-chain burn+release transaction.
+        sToken is NonTransferable — this is the only way to move value out of a vault.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UnshieldInput"
+      responses:
+        "200":
+          description: OTS verified, unshield queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnshieldResult"
+        "400":
+          description: Invalid OTS pre-image or input
+        "404":
+          description: Vault not found
+
+  /airsign/mint:
+    post:
+      operationId: airsignMint
+      tags: [vault]
+      summary: Burn sSOL on-chain, lock SOL in AirsignEscrow PDA. No recipient needed yet.
+      description: |
+        Step 1 of AirSign flow. Burns sSOL via OTS verification on-chain (relayer-mediated).
+        SOL is locked in a program-owned AirsignEscrow PDA identified by a server-generated nonce.
+        No recipient is specified at this stage. Use POST /airsign/attach-voucher to assign a
+        recipient and create the deliverable voucher (Ed25519 sign, can be done offline).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AirsignMintInput"
+      responses:
+        "200":
+          description: sSOL burned on-chain, SOL locked in escrow. Nonce returned for voucher step.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AirsignMintResult"
+        "400":
+          description: Invalid OTS pre-image or input
+        "404":
+          description: Vault not found
+
+  /airsign/attach-voucher:
+    post:
+      operationId: airsignAttachVoucher
+      tags: [vault]
+      summary: Attach Ed25519 voucher to a minted aSOL escrow. Step 2 of AirSign flow.
+      description: |
+        Step 2 of AirSign flow. After minting aSOL (POST /airsign/mint), the issuer signs a
+        56-byte voucher message offline (Ed25519 via Phantom signMessage) locking in the recipient.
+        This call stores the signature in DB, making the voucher claimable.
+        The signing step itself requires no internet -- only this POST does.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AirsignAttachVoucherInput"
+      responses:
+        "200":
+          description: Voucher attached. Claim link ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AirsignAttachVoucherResult"
+        "400":
+          description: Invalid nonce, signature mismatch, or already has voucher
+        "404":
+          description: Mint not found
+
+  /airsign/mints/{wallet}:
+    get:
+      operationId: getAirsignMints
+      tags: [vault]
+      summary: List minted aSOL escrows that have no voucher yet
+      parameters:
+        - name: wallet
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Pending mints (no voucher attached)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AirsignMintsResult"
+
+  /airsign/vouchers/{wallet}:
+    get:
+      operationId: getAirsignVouchers
+      tags: [vault]
+      summary: List vouchers issued by a wallet
+      parameters:
+        - name: wallet
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Issued vouchers
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AirsignVouchersResult"
+
+  /airsign/voucher/{nonce}:
+    get:
+      operationId: getAirsignVoucher
+      tags: [vault]
+      summary: Get public voucher details for claim page
+      parameters:
+        - name: nonce
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Voucher details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AirsignVoucherResult"
+        "404":
+          description: Voucher not found
+
+  /airsign/voucher/{nonce}/claim:
+    post:
+      operationId: airsignClaimVoucher
+      tags: [vault]
+      summary: Execute on-chain claim, release escrowed SOL to fixed recipient
+      description: |
+        No wallet connection required. The relayer builds and broadcasts the claim_airsign
+        instruction. Ed25519 signature is verified on-chain. SOL goes to the recipient
+        that was fixed at voucher signing time -- recipient cannot be changed.
+      parameters:
+        - name: nonce
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: SOL released to recipient on-chain
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AirsignClaimResult"
+        "400":
+          description: Already claimed or invalid voucher
+        "404":
+          description: Voucher not found
+
+  /vault/{wallet}:
+    get:
+      operationId: getVault
+      tags: [vault]
+      summary: Get vault info
+      description: Returns vault info for a wallet from DB
+      parameters:
+        - name: wallet
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Vault info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VaultResult"
+
 components:
   schemas:
     HealthStatus:
       type: object
+      required: [status]
       properties:
         status:
           type: string
-      required:
-        - status
 
+    StatusCheck:
+      type: object
+      required: [name, status, latency]
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+        latency:
+          type: number
+        detail:
+          type: ["string", "null"]
+
+    StatusResult:
+      type: object
+      required: [checks, timestamp]
+      properties:
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/StatusCheck"
+        timestamp:
+          type: string
+
+    RpcRequest:
+      type: object
+      required: [jsonrpc, method, id]
+      properties:
+        jsonrpc:
+          type: string
+        method:
+          type: string
+        params:
+          type: array
+          items: {}
+        id:
+          type: ["integer", "string"]
+
+    RpcResponse:
+      type: object
+      properties:
+        jsonrpc:
+          type: string
+        result: {}
+        error: {}
+        id:
+          type: ["integer", "string", "null"]
+
+    TokenBalance:
+      type: object
+      required: [mint, amount, decimals, uiAmount]
+      properties:
+        mint:
+          type: string
+        name:
+          type: ["string", "null"]
+        symbol:
+          type: ["string", "null"]
+        amount:
+          type: string
+        decimals:
+          type: integer
+        uiAmount:
+          type: number
+
+    PortfolioResult:
+      type: object
+      required: [wallet, solBalance, tokens]
+      properties:
+        wallet:
+          type: string
+        solBalance:
+          type: number
+        tokens:
+          type: array
+          items:
+            $ref: "#/components/schemas/TokenBalance"
+
+    VaultBalance:
+      type: object
+      required: [token, mint, shieldedAmount, decimals, updatedAt]
+      properties:
+        token:
+          type: string
+        mint:
+          type: string
+        shieldedAmount:
+          type: number
+        decimals:
+          type: integer
+        updatedAt:
+          type: string
+
+    VaultBalancesResult:
+      type: object
+      required: [wallet, balances, programDeployed]
+      properties:
+        wallet:
+          type: string
+        balances:
+          type: array
+          items:
+            $ref: "#/components/schemas/VaultBalance"
+        programDeployed:
+          type: boolean
+
+    Transaction:
+      type: object
+      required: [signature, type, timestamp, status]
+      properties:
+        signature:
+          type: string
+        type:
+          type: string
+        timestamp:
+          type: ["integer", "null"]
+        status:
+          type: string
+        token:
+          type: ["string", "null"]
+        amount:
+          type: ["number", "null"]
+
+    TransactionListResult:
+      type: object
+      required: [wallet, transactions]
+      properties:
+        wallet:
+          type: string
+        transactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transaction"
+
+    RelayInput:
+      type: object
+      required: [transaction]
+      properties:
+        transaction:
+          type: string
+          description: Base64-encoded VersionedTransaction. Fee payer must be set to SignitoRelay public key for gasless mode.
+        wallet:
+          type: string
+          description: Sender wallet address (base58) — used for rate limiting. Optional but recommended.
+
+    RelayResult:
+      type: object
+      required: [signature, gasless]
+      properties:
+        signature:
+          type: string
+          description: On-chain transaction signature
+        gasless:
+          type: boolean
+          description: True if SignitoRelay paid the fee
+        rlRemaining:
+          type: integer
+          description: Rate limit remaining for this wallet this hour
+
+    RelayInfoResult:
+      type: object
+      required: [feePayer, ready, balanceLamports, balanceSol, allowedPrograms]
+      properties:
+        feePayer:
+          type: ["string", "null"]
+          description: SignitoRelay public key (base58). Set this as fee_payer in your transaction.
+        ready:
+          type: boolean
+          description: True if gasless relay is available
+        balanceLamports:
+          type: integer
+          description: Relayer SOL balance in lamports
+        balanceSol:
+          type: number
+          description: Relayer SOL balance
+        allowedPrograms:
+          type: array
+          items:
+            type: string
+          description: Program IDs allowed in relayed transactions
+
+    AirsignMintInput:
+      type: object
+      required: [wallet, otsPreimage, amount, token]
+      properties:
+        wallet:
+          type: string
+          description: Issuer wallet address (base58)
+        otsPreimage:
+          type: string
+          description: 64-char hex OTS pre-image. Server verifies SHA-256(preimage) == vault tip, then calls mint_airsign on-chain to burn sSOL.
+        amount:
+          type: number
+          description: Amount of SOL to lock in AirsignEscrow PDA
+        token:
+          type: string
+          description: Base token symbol e.g. "SOL"
+
+    AirsignMintResult:
+      type: object
+      required: [success, escrowPda, nonce, txSig, newDepth]
+      properties:
+        success:
+          type: boolean
+        escrowPda:
+          type: string
+          description: On-chain AirsignEscrow PDA address (base58)
+        nonce:
+          type: string
+          description: 32-char hex nonce identifying the escrow
+        txSig:
+          type: string
+          description: On-chain transaction signature
+        newDepth:
+          type: integer
+          description: Remaining OTS depth after this mint
+
+    AirsignAttachVoucherInput:
+      type: object
+      required: [wallet, nonce, voucherMsgHex, sigHex]
+      properties:
+        wallet:
+          type: string
+          description: Issuer wallet address (base58)
+        nonce:
+          type: string
+          description: 32-char hex nonce from the mint step
+        voucherMsgHex:
+          type: string
+          description: "114-char hex (57 bytes): byte 0 domain sep 0x53, bytes 1-8 amount u64LE, bytes 9-40 recipient pubkey, bytes 41-56 nonce"
+        sigHex:
+          type: string
+          description: 128-char hex Ed25519 signature over voucherMsgHex by issuer wallet
+
+    AirsignAttachVoucherResult:
+      type: object
+      required: [success, claimPath, recipient]
+      properties:
+        success:
+          type: boolean
+        claimPath:
+          type: string
+          description: Relative URL for the claim page e.g. /claim/{nonce}
+        recipient:
+          type: string
+          description: Fixed recipient address extracted from voucher message
+
+    AirsignPendingMint:
+      type: object
+      required: [nonce, token, amount, escrowPda, createdAt]
+      properties:
+        nonce:
+          type: string
+        token:
+          type: string
+        amount:
+          type: number
+        escrowPda:
+          type: string
+        mintTxSig:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+
+    AirsignMintsResult:
+      type: object
+      required: [mints]
+      properties:
+        mints:
+          type: array
+          items:
+            $ref: "#/components/schemas/AirsignPendingMint"
+
+    AirsignIssuedVoucher:
+      type: object
+      required: [nonce, token, amount, claimStatus, escrowPda, createdAt]
+      properties:
+        nonce:
+          type: string
+        token:
+          type: string
+          description: Base token symbol e.g. "SOL"
+        amount:
+          type: number
+        claimStatus:
+          type: string
+          description: "unclaimed | processing | claimed"
+        escrowPda:
+          type: string
+        createdAt:
+          type: string
+
+    AirsignVouchersResult:
+      type: object
+      required: [vouchers]
+      properties:
+        vouchers:
+          type: array
+          items:
+            $ref: "#/components/schemas/AirsignIssuedVoucher"
+
+    AirsignVoucherResult:
+      type: object
+      required: [nonce, issuerWallet, recipient, token, amount, claimStatus, escrowPda, createdAt]
+      properties:
+        nonce:
+          type: string
+        issuerWallet:
+          type: string
+          description: Masked issuer wallet (first 8 + last 6 chars)
+        recipient:
+          type: string
+          description: Fixed recipient address -- only this wallet receives the SOL
+        token:
+          type: string
+        amount:
+          type: number
+        claimStatus:
+          type: string
+          description: "unclaimed | processing | claimed"
+        escrowPda:
+          type: string
+          description: On-chain escrow PDA address
+        txSig:
+          type: ["string", "null"]
+          description: Claim transaction signature (set when claimed)
+        createdAt:
+          type: string
+
+    AirsignClaimResult:
+      type: object
+      required: [success, txSig, recipient]
+      properties:
+        success:
+          type: boolean
+        txSig:
+          type: string
+          description: On-chain transaction signature of the claim
+        recipient:
+          type: string
+          description: Address that received the SOL
+
+    ZkTransferInput:
+      type: object
+      required: [wallet, amount, recipient, token, preimage]
+      properties:
+        wallet:
+          type: string
+          description: Solana wallet address (base58) — vault owner
+        amount:
+          type: number
+          description: Amount of sToken to transfer (must not exceed shielded balance)
+        recipient:
+          type: string
+          description: Destination Solana address (use a fresh wallet to break on-chain link)
+        token:
+          type: string
+          description: Base token symbol e.g. "SOL"
+        preimage:
+          type: string
+          description: OTS pre-image H_{n-1} derived client-side from vault code. Server verifies SHA-256(preimage) == current tip.
+
+    ZkTransferResult:
+      type: object
+      required: [success, txSig]
+      properties:
+        success:
+          type: boolean
+        txSig:
+          type: string
+          description: On-chain signature of relay to recipient transfer
+
+    StealthDepositInput:
+      type: object
+      required: [wallet, commitment, amount, token, depositTxSig]
+      properties:
+        wallet:
+          type: string
+          description: Depositor wallet address (base58)
+        commitment:
+          type: string
+          description: sha256(nullifier) hex (64 chars). Server stores only the commitment, never the nullifier.
+        amount:
+          type: number
+          description: SOL amount deposited to relay wallet
+        token:
+          type: string
+          description: Token symbol, currently "SOL"
+        depositTxSig:
+          type: string
+          description: On-chain transaction signature of the SOL transfer to the relay wallet
+
+    StealthDepositResult:
+      type: object
+      required: [success, depositId]
+      properties:
+        success:
+          type: boolean
+        depositId:
+          type: integer
+
+    StealthWithdrawInput:
+      type: object
+      required: [nullifier, recipient]
+      properties:
+        nullifier:
+          type: string
+          description: The 64-char hex secret nullifier. Server computes sha256(nullifier) to locate the deposit.
+        recipient:
+          type: string
+          description: Destination Solana address (should be a fresh wallet to sever on-chain link)
+
+    StealthWithdrawResult:
+      type: object
+      required: [success, txSig]
+      properties:
+        success:
+          type: boolean
+        txSig:
+          type: string
+          description: On-chain signature of relay to recipient transfer
+
+    StealthPending:
+      type: object
+      required: [id, commitment, amount, token, createdAt]
+      properties:
+        id:
+          type: integer
+        commitment:
+          type: string
+        nullifier:
+          type: ["string", "null"]
+        amount:
+          type: ["number", "null"]
+        token:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+
+    StealthPendingResult:
+      type: object
+      required: [pending]
+      properties:
+        pending:
+          type: array
+          items:
+            $ref: "#/components/schemas/StealthPending"
+
+    PlatformStats:
+      type: object
+      required: [totalVaults, totalTransactions, transactionsUnshielded, totalVaultValue, protocolRevenue, totalVaultValueUsd, protocolRevenueUsd]
+      properties:
+        totalVaults:
+          type: integer
+          description: Combined vault count across Solana and Base chain
+        totalTransactions:
+          type: integer
+          description: Total shield transactions across all chains
+        transactionsUnshielded:
+          type: integer
+          description: Total unshield and ZK-transfer transactions across all chains
+        totalVaultValue:
+          type: number
+          description: Cumulative SOL shielded (Solana only, for backward compat)
+        totalVaultValueUsd:
+          type: number
+          description: Cumulative USD value of all shielded volume across Solana and Base, converted at price of each shield
+        protocolRevenue:
+          type: number
+          description: Cumulative SOL collected as 0.15% protocol fee (Solana only, for backward compat)
+        protocolRevenueUsd:
+          type: number
+          description: Cumulative USD value of 0.15% protocol fee across all chains
+
+    UnshieldInput:
+      type: object
+      required: [wallet, amount, destination, preimage]
+      properties:
+        wallet:
+          type: string
+          description: Solana wallet address (base58) — vault owner
+        amount:
+          type: number
+          description: Amount of sToken to unshield
+        destination:
+          type: string
+          description: Any Solana address to receive the unwrapped tokens
+        preimage:
+          type: string
+          description: OTS pre-image H_{n-1} derived client-side from vault code. Server verifies SHA-256(preimage) == current tip.
+        token:
+          type: string
+          description: Base token symbol e.g. "SOL". Used to record the unshield transaction.
+
+    UnshieldResult:
+      type: object
+      required: [success, newChainDepth]
+      properties:
+        success:
+          type: boolean
+        newChainDepth:
+          type: integer
+          description: Remaining OTS depth after this withdrawal
+        txBase64:
+          type: ["string", "null"]
+          description: Base64-encoded unsigned VersionedTransaction for client to sign and broadcast
+        onchainError:
+          type: ["string", "null"]
+          description: Non-fatal error building on-chain tx (OTS still consumed)
+
+
+    CreateVaultInput:
+      type: object
+      required: [wallet, codeHash, chainDepth]
+      properties:
+        wallet:
+          type: string
+          description: Solana wallet address (base58)
+        codeHash:
+          type: string
+          description: PBKDF2 hash of the vault code, derived client-side. The vault code itself never leaves the browser.
+        chainDepth:
+          type: integer
+          description: Number of OTS signatures to pre-generate (default 32)
+        token:
+          type: string
+          description: Base token symbol e.g. "SOL". Used to record the initial shield transaction.
+        amount:
+          type: number
+          description: Amount being shielded. Used to record the initial shield transaction.
+        mint:
+          type: string
+          description: sSOL Token-2022 mint address (base58), generated client-side as mintStokenKp.publicKey.
+        stokenAccount:
+          type: string
+          description: sSOL token account address (base58), generated client-side as ownerStokenAtaKp.publicKey. Used by the unshield builder to locate the token account to burn from.
+        txSig:
+          type: string
+          description: On-chain transaction signature confirming vault creation via initialize_vault.
+
+    VaultDepositInput:
+      type: object
+      required: [wallet, token, amount]
+      properties:
+        wallet:
+          type: string
+          description: Solana wallet address (base58)
+        token:
+          type: string
+          description: Base token symbol e.g. "SOL", "USDC"
+        amount:
+          type: number
+          description: Amount being deposited to the existing vault
+        txSig:
+          type: string
+          description: On-chain transaction signature confirming the SOL transfer to vault PDA.
+
+    VaultDepositResult:
+      type: object
+      required: [success]
+      properties:
+        success:
+          type: boolean
+
+    Vault:
+      type: object
+      required: [wallet, chainDepth, createdAt]
+      properties:
+        wallet:
+          type: string
+        chainDepth:
+          type: integer
+        lastOts:
+          type: ["string", "null"]
+        mint:
+          type: ["string", "null"]
+          description: sToken mint address (base58)
+        stokenAccount:
+          type: ["string", "null"]
+          description: sToken token account address (base58)
+        createdAt:
+          type: string
+
+    VaultResult:
+      type: object
+      required: []
+      properties:
+        vault:
+          oneOf:
+            - $ref: "#/components/schemas/Vault"
+            - type: "null"

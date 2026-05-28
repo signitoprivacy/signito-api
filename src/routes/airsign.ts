@@ -1,236 +1,334 @@
 import { Router, type IRouter } from "express";
-import { db, vaultsTable, airsignBalancesTable, airsignVouchersTable, transactionsTable, vaultBalancesTable } from "@workspace/db";
-import { eq, and } from "drizzle-orm";
+import { db, vaultsTable, airsignVouchersTable, transactionsTable, vaultBalancesTable } from "@workspace/db";
+import { eq, isNull, and } from "drizzle-orm";
 import { createHash, randomBytes } from "crypto";
 import { z } from "zod";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import { Keypair, PublicKey, Connection } from "@solana/web3.js";
+import { heliusRpcUrl } from "../lib/rpc.js";
+import {
+  buildMintAirsignIx,
+  buildClaimAirsignIx,
+  buildEd25519SigVerifyIx,
+  buildVersionedTx,
+  deriveAirsignEscrowPda,
+} from "@workspace/program";
 
 const router: IRouter = Router();
 
-function sha256Hex(hex: string): string {
-  return createHash("sha256").update(Buffer.from(hex, "hex")).digest("hex");
+function sha256(input: Buffer): Buffer {
+  return createHash("sha256").update(input).digest();
 }
 
-function makeNonce(): string {
-  return randomBytes(16).toString("hex");
+function getRpcConnection(): Connection {
+  return new Connection(heliusRpcUrl(), "confirmed");
 }
 
-function offchainSig(): string {
-  return "offchain:" + randomBytes(16).toString("hex");
+function getRelayerKeypair(): Keypair {
+  const key = process.env.RELAYER_PRIVATE_KEY;
+  if (!key) throw new Error("RELAYER_PRIVATE_KEY not set");
+  const bytes = bs58.decode(key);
+  return Keypair.fromSecretKey(bytes);
 }
 
-const PrepareBody = z.object({
+// POST /airsign/mint
+// Step 1: Burns sSOL on-chain (OTS-verified, relayer-mediated), locks SOL in AirsignEscrow PDA.
+// No recipient required at this stage. Nonce is generated server-side.
+// Use POST /airsign/attach-voucher to assign recipient and sign the voucher (Step 2).
+
+const MintBody = z.object({
   wallet: z.string().min(32).max(44),
-  token: z.string().min(2).max(16),
+  otsPreimage: z.string().length(64),
   amount: z.number().positive(),
-  preimage: z.string().length(64),
-  expiryHours: z.number().int().min(1).max(8760).default(24),
+  token: z.string().min(2).max(16),
 });
 
-// POST /airsign/prepare
-// Converts sToken to aToken (airToken) for offline AirSign voucher.
-// Step 1 of the AirSign flow: verifies OTS, mints aToken record, returns nonce.
-router.post("/airsign/prepare", async (req, res): Promise<void> => {
-  const parsed = PrepareBody.safeParse(req.body);
+router.post("/airsign/mint", async (req, res): Promise<void> => {
+  const parsed = MintBody.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.message });
     return;
   }
 
-  const { wallet, token, amount, preimage, expiryHours } = parsed.data;
-  const sToken = "s" + token;
-  const aToken = "a" + token;
+  const { wallet, otsPreimage, amount, token } = parsed.data;
 
   try {
-    const [vault] = await db
-      .select()
-      .from(vaultsTable)
-      .where(eq(vaultsTable.wallet, wallet));
+    const [vault] = await db.select().from(vaultsTable).where(eq(vaultsTable.wallet, wallet));
 
     if (!vault) {
       res.status(404).json({ error: "Vault not found. Shield tokens first." });
       return;
     }
-
     if (!vault.lastOts) {
-      res.status(400).json({ error: "Vault has no OTS tip" });
+      res.status(400).json({ error: "Vault has no OTS tip. Re-initialize vault." });
       return;
     }
-
     if (vault.chainDepth <= 0) {
-      res.status(400).json({ error: "OTS chain exhausted. Vault depth is 0." });
+      res.status(400).json({ error: "OTS chain exhausted. Refresh vault first." });
+      return;
+    }
+    if (!vault.mint || !vault.stokenAccount) {
+      res.status(400).json({ error: "Vault missing sToken info." });
       return;
     }
 
-    // OTS verification: SHA-256(preimage) must equal current tip
-    const computed = sha256Hex(preimage);
-    if (computed !== vault.lastOts) {
-      req.log.warn({ wallet, computed, tip: vault.lastOts }, "AirSign prep: OTS mismatch");
+    // Verify OTS preimage
+    const computedOts = createHash("sha256").update(Buffer.from(otsPreimage, "hex")).digest("hex");
+    if (computedOts !== vault.lastOts) {
+      req.log.warn({ wallet, computedOts, tip: vault.lastOts }, "AirSign mint: OTS mismatch");
       res.status(400).json({ error: "Invalid vault code. OTS pre-image does not match." });
       return;
     }
 
-    const newDepth = vault.chainDepth - 1;
-    const nonce = makeNonce();
-    const expiresAt = new Date(Date.now() + expiryHours * 3_600_000);
+    // Generate nonce server-side
+    const nonceBuf = randomBytes(16);
+    const nonce = nonceBuf.toString("hex");
+    const nonceHashBuf = sha256(nonceBuf);
+    const nonceHash = nonceHashBuf.toString("hex");
 
-    // Update vault OTS tip (consumes one depth level)
+    // Check for duplicate nonce (very unlikely but guard anyway)
+    const [existing] = await db
+      .select().from(airsignVouchersTable).where(eq(airsignVouchersTable.nonce, nonce));
+    if (existing) {
+      res.status(400).json({ error: "Nonce collision. Please retry." });
+      return;
+    }
+
+    const amountLamports = BigInt(Math.round(amount * 1_000_000_000));
+    const otsPreimageBuf = Buffer.from(otsPreimage, "hex");
+    const relayer = getRelayerKeypair();
+    const connection = getRpcConnection();
+    const mintStoken = new PublicKey(vault.mint);
+    const stokenAta = new PublicKey(vault.stokenAccount);
+
+    const ix = buildMintAirsignIx(relayer.publicKey, mintStoken, stokenAta, {
+      otsPreimage: otsPreimageBuf,
+      amount: amountLamports,
+      nonceHash: nonceHashBuf,
+    });
+
+    const tx = await buildVersionedTx(connection, relayer.publicKey, [ix], [relayer]);
+    const txSig = await connection.sendTransaction(tx, { skipPreflight: false });
+    await connection.confirmTransaction(txSig, "confirmed");
+
+    // Advance OTS chain in DB
     await db
       .update(vaultsTable)
-      .set({ lastOts: preimage, chainDepth: newDepth })
+      .set({ lastOts: otsPreimage, chainDepth: vault.chainDepth - 1 })
       .where(eq(vaultsTable.wallet, wallet));
 
-    // Mint aToken record in DB
-    await db
-      .insert(airsignBalancesTable)
-      .values({
-        wallet,
-        token,
-        aToken,
-        amount: amount.toString(),
-        nonce,
-        claimed: false,
-        expiresAt,
-      });
+    // Decrement sSOL vault balance ledger so the UI reflects the burn immediately
+    const sToken = "s" + token;
+    const [balRow] = await db
+      .select()
+      .from(vaultBalancesTable)
+      .where(and(eq(vaultBalancesTable.wallet, wallet), eq(vaultBalancesTable.token, sToken)));
+    if (balRow) {
+      const current = parseFloat(balRow.shieldedAmount ?? "0");
+      const next = Math.max(0, current - amount);
+      await db
+        .update(vaultBalancesTable)
+        .set({ shieldedAmount: next.toFixed(9) })
+        .where(eq(vaultBalancesTable.id, balRow.id));
+    }
 
-    req.log.info({ wallet, aToken, amount, nonce, newDepth }, "AirSign prepare: aToken minted");
+    const [escrowPda] = deriveAirsignEscrowPda(nonceHashBuf);
+
+    // Store mint in DB -- no recipient or voucher yet
+    await db.insert(airsignVouchersTable).values({
+      issuerWallet: wallet,
+      token,
+      amount: amount.toString(),
+      nonce,
+      nonceHash,
+      escrowPda: escrowPda.toBase58(),
+      mintTxSig: txSig,
+      claimStatus: "minted",
+    });
 
     try {
       await db.insert(transactionsTable).values({
         wallet,
-        signature: offchainSig(),
+        signature: txSig,
         type: "mint",
-        token: aToken,
+        token: "a" + token,
         amount: amount.toFixed(9),
         status: "confirmed",
       });
+    } catch { /* non-fatal */ }
 
-      const [existing] = await db
-        .select()
-        .from(vaultBalancesTable)
-        .where(
-          and(
-            eq(vaultBalancesTable.wallet, wallet),
-            eq(vaultBalancesTable.token, sToken),
-          ),
-        );
-      if (existing) {
-        const next = Math.max(0, parseFloat(existing.shieldedAmount ?? "0") - amount);
-        await db
-          .update(vaultBalancesTable)
-          .set({ shieldedAmount: next.toFixed(9) })
-          .where(eq(vaultBalancesTable.id, existing.id));
-      }
-    } catch (recordErr) {
-      req.log.warn({ recordErr }, "Failed to record mint transaction (non-fatal)");
-    }
+    req.log.info({ wallet, nonce, escrowPda: escrowPda.toBase58(), amount, txSig }, "AirSign minted");
 
     res.json({
       success: true,
-      aToken,
-      amount,
+      escrowPda: escrowPda.toBase58(),
       nonce,
-      newChainDepth: newDepth,
-      depthAtIssue: vault.chainDepth,
-      expiresAt: expiresAt.toISOString(),
+      txSig,
+      newDepth: vault.chainDepth - 1,
     });
   } catch (err) {
-    req.log.error({ err }, "AirSign prepare error");
-    res.status(500).json({ error: "AirSign prepare failed" });
+    req.log.error({ err }, "AirSign mint error");
+    res.status(500).json({ error: "AirSign mint failed" });
   }
 });
 
-// POST /airsign/create-voucher
-// Step 2 of AirSign flow: stores binary Ed25519 signed voucher for a prepared nonce.
-// The nonce must already exist in airsign_balances (created by /airsign/prepare).
-const CreateVoucherBody = z.object({
+// POST /airsign/attach-voucher
+// Step 2: Attach Ed25519 voucher to an existing minted aSOL escrow.
+// Issuer signs offline (Phantom signMessage), then calls this to store the voucher.
+// Voucher message format (57 bytes): [0] 0x53 domain sep, [1..9] amount u64LE, [9..41] recipient pubkey, [41..57] nonce 16 bytes.
+
+const AttachVoucherBody = z.object({
   wallet: z.string().min(32).max(44),
   nonce: z.string().length(32),
-  recipient: z.string().min(32).max(44),
-  voucherMsgHex: z.string().length(128),
+  voucherMsgHex: z.string().length(114), // 57 bytes * 2
   sigHex: z.string().length(128),
-  token: z.string().min(2).max(16),
-  amount: z.number().positive(),
-  depthAtIssue: z.number().int().positive(),
-  expiresAt: z.string(),
 });
 
-router.post("/airsign/create-voucher", async (req, res): Promise<void> => {
-  const parsed = CreateVoucherBody.safeParse(req.body);
+router.post("/airsign/attach-voucher", async (req, res): Promise<void> => {
+  const parsed = AttachVoucherBody.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.message });
     return;
   }
 
-  const { wallet, nonce, recipient, voucherMsgHex, sigHex, token, amount, depthAtIssue, expiresAt } = parsed.data;
+  const { wallet, nonce, voucherMsgHex, sigHex } = parsed.data;
 
   try {
-    // Verify the nonce exists in airsign_balances for this wallet
-    const [balance] = await db
-      .select()
-      .from(airsignBalancesTable)
-      .where(and(
-        eq(airsignBalancesTable.nonce, nonce),
-        eq(airsignBalancesTable.wallet, wallet),
-      ));
-
-    if (!balance) {
-      res.status(404).json({ error: "Nonce not found. Call /airsign/prepare first." });
-      return;
-    }
-
-    if (balance.claimed) {
-      res.status(400).json({ error: "This nonce has already been used." });
-      return;
-    }
-
-    // Verify the nonce in the binary voucher msg matches [40..56] bytes
-    const nonceFromMsg = voucherMsgHex.slice(80, 112);
-    if (nonceFromMsg !== nonce) {
-      res.status(400).json({ error: "Voucher message nonce does not match prepared nonce." });
-      return;
-    }
-
-    // Check for existing voucher with this nonce
-    const [existing] = await db
+    const [row] = await db
       .select()
       .from(airsignVouchersTable)
       .where(eq(airsignVouchersTable.nonce, nonce));
 
-    if (existing) {
-      res.status(400).json({ error: "Voucher already created for this nonce." });
+    if (!row) {
+      res.status(404).json({ error: "Mint not found for this nonce." });
       return;
     }
 
-    const expiresAtDate = new Date(expiresAt);
-    if (isNaN(expiresAtDate.getTime()) || expiresAtDate.getTime() < Date.now()) {
-      res.status(400).json({ error: "Voucher is already expired." });
+    if (row.issuerWallet !== wallet) {
+      res.status(403).json({ error: "Wallet does not match issuer." });
       return;
     }
 
-    await db.insert(airsignVouchersTable).values({
-      issuerWallet: wallet,
+    if (row.voucherMsgHex !== null) {
+      res.status(400).json({ error: "Voucher already attached to this mint." });
+      return;
+    }
+
+    if (row.claimStatus !== "minted") {
+      res.status(400).json({ error: "Mint is not in a state that accepts a voucher." });
+      return;
+    }
+
+    // Verify Ed25519 signature
+    const voucherMsgBuf = Buffer.from(voucherMsgHex, "hex");
+    const sigBuf = Buffer.from(sigHex, "hex");
+    const issuerPubkey = new PublicKey(wallet);
+    const isValidSig = nacl.sign.detached.verify(voucherMsgBuf, sigBuf, issuerPubkey.toBytes());
+    if (!isValidSig) {
+      req.log.warn({ wallet }, "AirSign attach-voucher: Ed25519 sig invalid");
+      res.status(400).json({ error: "Ed25519 signature verification failed." });
+      return;
+    }
+
+    // Validate domain separator
+    if (voucherMsgBuf[0] !== 0x53) {
+      res.status(400).json({ error: "Invalid voucher message format (missing domain separator)." });
+      return;
+    }
+
+    // Validate nonce in voucher message matches DB nonce (bytes [41..57])
+    const msgNonce = voucherMsgBuf.slice(41, 57).toString("hex");
+    if (msgNonce !== nonce) {
+      res.status(400).json({ error: "Nonce in voucher message does not match mint nonce." });
+      return;
+    }
+
+    // Extract recipient from voucher message bytes [9..41]
+    const recipient = new PublicKey(voucherMsgBuf.slice(9, 41)).toBase58();
+
+    // Update DB row with voucher data
+    await db
+      .update(airsignVouchersTable)
+      .set({ recipient, voucherMsgHex, sigHex, claimStatus: "unclaimed" })
+      .where(eq(airsignVouchersTable.nonce, nonce));
+
+    req.log.info({ wallet, nonce, recipient }, "AirSign voucher attached");
+
+    res.json({
+      success: true,
+      claimPath: `/claim/${nonce}`,
       recipient,
-      token,
-      amount: amount.toString(),
-      nonce,
-      voucherMsgHex,
-      sigHex,
-      depthAtIssue: depthAtIssue.toString(),
-      expiresAt: expiresAtDate,
-      claimStatus: "unclaimed",
     });
-
-    req.log.info({ wallet, nonce, recipient, amount, token }, "AirSign voucher created");
-
-    res.json({ success: true, nonce, claimPath: `/claim/${nonce}` });
   } catch (err) {
-    req.log.error({ err }, "AirSign create-voucher error");
-    res.status(500).json({ error: "Failed to create voucher" });
+    req.log.error({ err }, "AirSign attach-voucher error");
+    res.status(500).json({ error: "Attach voucher failed" });
+  }
+});
+
+// GET /airsign/mints/:wallet
+// Returns minted aSOL escrows that have no voucher attached yet (claimStatus = "minted").
+
+router.get("/airsign/mints/:wallet", async (req, res): Promise<void> => {
+  res.set("Cache-Control", "no-store");
+  const wallet = req.params.wallet as string;
+  try {
+    const rows = await db
+      .select()
+      .from(airsignVouchersTable)
+      .where(eq(airsignVouchersTable.issuerWallet, wallet));
+
+    const mints = rows
+      .filter((r) => r.claimStatus === "minted" && r.voucherMsgHex === null)
+      .map((r) => ({
+        nonce: r.nonce,
+        token: r.token,
+        amount: parseFloat(r.amount),
+        escrowPda: r.escrowPda,
+        mintTxSig: r.mintTxSig ?? null,
+        createdAt: r.createdAt.toISOString(),
+      }));
+
+    res.json({ mints });
+  } catch (err) {
+    req.log.error({ err }, "AirSign list-mints error");
+    res.status(500).json({ error: "Failed to fetch mints" });
+  }
+});
+
+// GET /airsign/vouchers/:wallet
+// Returns all vouchers issued by this wallet (from DB).
+
+router.get("/airsign/vouchers/:wallet", async (req, res): Promise<void> => {
+  res.set("Cache-Control", "no-store");
+  const wallet = req.params.wallet as string;
+  try {
+    const rows = await db
+      .select()
+      .from(airsignVouchersTable)
+      .where(eq(airsignVouchersTable.issuerWallet, wallet));
+
+    const vouchers = rows
+      .filter((r) => r.claimStatus !== "minted")
+      .map((v) => ({
+        nonce: v.nonce,
+        token: v.token,
+        amount: parseFloat(v.amount),
+        claimStatus: v.claimStatus,
+        escrowPda: v.escrowPda,
+        createdAt: v.createdAt.toISOString(),
+      }));
+
+    res.json({ vouchers });
+  } catch (err) {
+    req.log.error({ err }, "AirSign list-vouchers error");
+    res.status(500).json({ error: "Failed to fetch vouchers" });
   }
 });
 
 // GET /airsign/voucher/:nonce
 // Returns public voucher details for the claim page.
+
 router.get("/airsign/voucher/:nonce", async (req, res): Promise<void> => {
   const nonce = req.params.nonce as string;
 
@@ -245,8 +343,10 @@ router.get("/airsign/voucher/:nonce", async (req, res): Promise<void> => {
       return;
     }
 
-    const now = Date.now();
-    const expired = voucher.expiresAt.getTime() < now;
+    if (!voucher.voucherMsgHex) {
+      res.status(400).json({ error: "Voucher not yet attached. Complete step 2 first." });
+      return;
+    }
 
     res.json({
       nonce: voucher.nonce,
@@ -254,9 +354,10 @@ router.get("/airsign/voucher/:nonce", async (req, res): Promise<void> => {
       recipient: voucher.recipient,
       token: voucher.token,
       amount: parseFloat(voucher.amount),
-      expiresAt: voucher.expiresAt.toISOString(),
-      claimStatus: expired && voucher.claimStatus === "unclaimed" ? "expired" : voucher.claimStatus,
+      claimStatus: voucher.claimStatus,
+      escrowPda: voucher.escrowPda,
       txSig: voucher.txSig ?? null,
+      createdAt: voucher.createdAt.toISOString(),
     });
   } catch (err) {
     req.log.error({ err }, "AirSign get-voucher error");
@@ -265,20 +366,10 @@ router.get("/airsign/voucher/:nonce", async (req, res): Promise<void> => {
 });
 
 // POST /airsign/voucher/:nonce/claim
-// Recipient submits claim request. Sets claimerWallet and moves status to "pending".
-const ClaimBody = z.object({
-  claimerWallet: z.string().min(32).max(44),
-});
+// Execute on-chain claim: verify Ed25519 sig, release escrowed SOL to fixed recipient.
 
 router.post("/airsign/voucher/:nonce/claim", async (req, res): Promise<void> => {
   const nonce = req.params.nonce as string;
-  const parsed = ClaimBody.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.message });
-    return;
-  }
-
-  const { claimerWallet } = parsed.data;
 
   try {
     const [voucher] = await db
@@ -291,8 +382,8 @@ router.post("/airsign/voucher/:nonce/claim", async (req, res): Promise<void> => 
       return;
     }
 
-    if (voucher.expiresAt.getTime() < Date.now()) {
-      res.status(400).json({ error: "Voucher has expired" });
+    if (!voucher.voucherMsgHex || !voucher.sigHex || !voucher.recipient) {
+      res.status(400).json({ error: "Voucher not ready for claim. Attach voucher first." });
       return;
     }
 
@@ -301,152 +392,72 @@ router.post("/airsign/voucher/:nonce/claim", async (req, res): Promise<void> => 
       return;
     }
 
-    if (voucher.recipient !== claimerWallet) {
-      res.status(400).json({ error: "Wallet does not match voucher recipient" });
+    if (voucher.claimStatus === "processing") {
+      res.status(400).json({ error: "Claim already in progress" });
       return;
     }
 
+    // Mark as processing to prevent double-claim
     await db
       .update(airsignVouchersTable)
-      .set({ claimStatus: "pending", claimerWallet })
+      .set({ claimStatus: "processing" })
       .where(eq(airsignVouchersTable.nonce, nonce));
 
-    req.log.info({ nonce, claimerWallet }, "AirSign voucher claim requested");
-
-    res.json({ success: true, status: "pending" });
-  } catch (err) {
-    req.log.error({ err }, "AirSign voucher claim error");
-    res.status(500).json({ error: "Failed to submit claim" });
-  }
-});
-
-// GET /airsign/pending-claims/:issuerWallet
-// Returns all pending claims for an issuer (so issuer can sign and release funds).
-router.get("/airsign/pending-claims/:issuerWallet", async (req, res): Promise<void> => {
-  const issuerWallet = req.params.issuerWallet as string;
-
-  try {
-    const rows = await db
-      .select()
-      .from(airsignVouchersTable)
-      .where(and(
-        eq(airsignVouchersTable.issuerWallet, issuerWallet),
-        eq(airsignVouchersTable.claimStatus, "pending"),
-      ));
-
-    const claims = rows.map((r) => ({
-      nonce: r.nonce,
-      recipient: r.recipient,
-      claimerWallet: r.claimerWallet,
-      token: r.token,
-      amount: parseFloat(r.amount),
-      depthAtIssue: parseInt(r.depthAtIssue.toString()),
-      expiresAt: r.expiresAt.toISOString(),
-      createdAt: r.createdAt.toISOString(),
-    }));
-
-    res.json({ issuerWallet, claims });
-  } catch (err) {
-    req.log.error({ err }, "AirSign pending-claims error");
-    res.json({ issuerWallet, claims: [] });
-  }
-});
-
-// POST /airsign/voucher/:nonce/release
-// Issuer confirms the unshield tx was signed and broadcast. Marks voucher as claimed.
-const ReleaseBody = z.object({
-  issuerWallet: z.string().min(32).max(44),
-  txSig: z.string().min(10),
-});
-
-router.post("/airsign/voucher/:nonce/release", async (req, res): Promise<void> => {
-  const nonce = req.params.nonce as string;
-  const parsed = ReleaseBody.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.message });
-    return;
-  }
-
-  const { issuerWallet, txSig } = parsed.data;
-
-  try {
-    const [voucher] = await db
-      .select()
-      .from(airsignVouchersTable)
-      .where(eq(airsignVouchersTable.nonce, nonce));
-
-    if (!voucher) {
-      res.status(404).json({ error: "Voucher not found" });
-      return;
-    }
-
-    if (voucher.issuerWallet !== issuerWallet) {
-      res.status(403).json({ error: "Not the issuer of this voucher" });
-      return;
-    }
-
-    if (voucher.claimStatus === "claimed") {
-      res.status(400).json({ error: "Already claimed" });
-      return;
-    }
-
-    await db
-      .update(airsignVouchersTable)
-      .set({ claimStatus: "claimed", txSig })
-      .where(eq(airsignVouchersTable.nonce, nonce));
-
-    // Record unshield transaction
     try {
-      await db.insert(transactionsTable).values({
-        wallet: issuerWallet,
-        signature: txSig,
-        type: "unshield",
-        token: voucher.token,
-        amount: parseFloat(voucher.amount).toFixed(9),
-        status: "confirmed",
+      const relayer = getRelayerKeypair();
+      const connection = getRpcConnection();
+
+      const issuer = new PublicKey(voucher.issuerWallet);
+      const recipient = new PublicKey(voucher.recipient);
+      const voucherMsgBuf = Buffer.from(voucher.voucherMsgHex, "hex");
+      const sigBuf = Buffer.from(voucher.sigHex, "hex");
+      const nonceHashBuf = Buffer.from(voucher.nonceHash, "hex");
+
+      const ed25519Ix = buildEd25519SigVerifyIx(
+        issuer.toBytes(),
+        voucherMsgBuf,
+        sigBuf
+      );
+
+      const claimIx = buildClaimAirsignIx(relayer.publicKey, issuer, recipient, {
+        nonceHash: nonceHashBuf,
+        voucherMsg: voucherMsgBuf,
+        sig: sigBuf,
       });
-    } catch {
-      // non-fatal
+
+      const tx = await buildVersionedTx(connection, relayer.publicKey, [ed25519Ix, claimIx], [relayer]);
+      const txSig = await connection.sendTransaction(tx, { skipPreflight: false });
+      await connection.confirmTransaction(txSig, "confirmed");
+
+      await db
+        .update(airsignVouchersTable)
+        .set({ claimStatus: "claimed", txSig })
+        .where(eq(airsignVouchersTable.nonce, nonce));
+
+      try {
+        await db.insert(transactionsTable).values({
+          wallet: voucher.issuerWallet,
+          signature: txSig,
+          type: "unshield",
+          token: voucher.token,
+          amount: parseFloat(voucher.amount).toFixed(9),
+          status: "confirmed",
+        });
+      } catch { /* non-fatal */ }
+
+      req.log.info({ nonce, txSig, recipient: voucher.recipient }, "AirSign claimed");
+
+      res.json({ success: true, txSig, recipient: voucher.recipient });
+    } catch (claimErr) {
+      await db
+        .update(airsignVouchersTable)
+        .set({ claimStatus: "unclaimed" })
+        .where(eq(airsignVouchersTable.nonce, nonce));
+      throw claimErr;
     }
-
-    req.log.info({ nonce, issuerWallet, txSig }, "AirSign voucher released");
-
-    res.json({ success: true, status: "claimed", txSig });
   } catch (err) {
-    req.log.error({ err }, "AirSign voucher release error");
-    res.status(500).json({ error: "Failed to release voucher" });
-  }
-});
-
-// GET /airsign/balances/:wallet
-// Returns all unclaimed aToken balances for a wallet.
-router.get("/airsign/balances/:wallet", async (req, res): Promise<void> => {
-  const wallet = req.params.wallet as string;
-
-  try {
-    const rows = await db
-      .select()
-      .from(airsignBalancesTable)
-      .where(and(
-        eq(airsignBalancesTable.wallet, wallet),
-        eq(airsignBalancesTable.claimed, false)
-      ));
-
-    const balances = rows.map((r) => ({
-      id: r.id,
-      token: r.token,
-      aToken: r.aToken,
-      amount: parseFloat(r.amount),
-      nonce: r.nonce,
-      claimed: r.claimed,
-      expiresAt: r.expiresAt?.toISOString() ?? null,
-      createdAt: r.createdAt.toISOString(),
-    }));
-
-    res.json({ wallet, balances });
-  } catch (err) {
-    req.log.error({ err }, "AirSign balances fetch error");
-    res.json({ wallet, balances: [] });
+    req.log.error({ err }, "AirSign claim error");
+    res.status(500).json({ error: "Claim failed" });
   }
 });
 

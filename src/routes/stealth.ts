@@ -1,14 +1,86 @@
 import { Router, type IRouter } from "express";
-import { createHash } from "crypto";
-import { db, stealthPendingTable, vaultsTable, vaultBalancesTable, transactionsTable } from "@workspace/db";
-import { eq, and, isNull } from "drizzle-orm";
+import { createHash, randomBytes } from "crypto";
+import { db, stealthPendingTable, vaultsTable, vaultBalancesTable, transactionsTable, mixWalletsTable } from "@workspace/db";
+import { eq, and, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
-import { PublicKey, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { Keypair, PublicKey, SystemProgram, LAMPORTS_PER_SOL, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import { getConnection, relayerKeypair, relayerReady } from "../lib/relayer.js";
 import { heliusRpcUrl } from "../lib/rpc.js";
-import { buildVersionedTx, buildZkUnshieldIx } from "@workspace/program";
+import {
+  buildVersionedTx,
+  buildPrivateSendIx,
+  buildFundFreshRelayerIx,
+  buildBurnAndQueueIx,
+  buildProcessQueueIx,
+  fetchUserState,
+} from "@workspace/program";
 
 const router: IRouter = Router();
+
+const SIM_MODE = process.env.SIM_MODE === "true";
+
+// Number of decoy accounts to burn alongside real zk-transfer burns.
+// Mirrors vault.ts unshield decoys for consistent anonymity set.
+// Set to 0 until on-chain program is upgraded with decoy_burn instruction.
+const MIX_ZK_DECOYS = Number(process.env.MIX_ZK_DECOYS ?? "20");
+
+
+// Pick available decoy accounts and atomically mark them in_use.
+async function pickAndReserveDecoys(count: number): Promise<Array<{ id: number; stokenAta: string }>> {
+  if (count <= 0) return [];
+  try {
+    const available = await db
+      .select({ id: mixWalletsTable.id, stokenAta: mixWalletsTable.stokenAta })
+      .from(mixWalletsTable)
+      .where(eq(mixWalletsTable.status, "available"))
+      .limit(count);
+    if (available.length === 0) return [];
+    const ids = available.map((r) => r.id);
+    await db
+      .update(mixWalletsTable)
+      .set({ status: "in_use", lastUsedAt: new Date() })
+      .where(sql`id = ANY(ARRAY[${sql.join(ids.map(id => sql`${id}`), sql`, `)}]::int[])`);
+    for (let i = available.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [available[i], available[j]] = [available[j], available[i]] as [typeof available[0], typeof available[0]];
+    }
+    return available;
+  } catch {
+    return [];
+  }
+}
+
+async function markDecoysDepeleted(ids: number[]): Promise<void> {
+  if (ids.length === 0) return;
+  try {
+    await db
+      .update(mixWalletsTable)
+      .set({ status: "depleted", lastUsedAt: new Date() })
+      .where(sql`id = ANY(ARRAY[${sql.join(ids.map(id => sql`${id}`), sql`, `)}]::int[])`);
+  } catch { /* non-fatal */ }
+}
+
+async function releaseDecoys(ids: number[]): Promise<void> {
+  if (ids.length === 0) return;
+  try {
+    await db
+      .update(mixWalletsTable)
+      .set({ status: "available" })
+      .where(sql`id = ANY(ARRAY[${sql.join(ids.map(id => sql`${id}`), sql`, `)}]::int[])`);
+  } catch { /* non-fatal */ }
+}
+
+function simSig(): string {
+  return "sim:" + randomBytes(32).toString("hex");
+}
+
+async function upsertStealthBalance(wallet: string, sToken: string, delta: number): Promise<void> {
+  const [existing] = await db.select().from(vaultBalancesTable).where(and(eq(vaultBalancesTable.wallet, wallet), eq(vaultBalancesTable.token, sToken)));
+  if (existing) {
+    const next = Math.max(0, parseFloat(existing.shieldedAmount ?? "0") + delta);
+    await db.update(vaultBalancesTable).set({ shieldedAmount: next.toFixed(9) }).where(eq(vaultBalancesTable.wallet, wallet));
+  }
+}
 
 const StealthDepositBody = z.object({
   wallet: z.string().min(32).max(44),
@@ -186,10 +258,14 @@ router.post("/stealth/withdraw", async (req, res): Promise<void> => {
     const relayPk = relayerKeypair.publicKey;
     const amountLamports = BigInt(Math.round(amountSol * LAMPORTS_PER_SOL));
 
+    // 0.15% protocol fee stays in relayer wallet; recipient receives net amount
+    const feeLamports = BigInt(Math.round(amountSol * 0.0015 * LAMPORTS_PER_SOL));
+    const netLamports = amountLamports - feeLamports;
+
     const ix = SystemProgram.transfer({
       fromPubkey: relayPk,
       toPubkey: recipientPk,
-      lamports: amountLamports,
+      lamports: netLamports,
     });
 
     const conn = getConnection();
@@ -226,13 +302,18 @@ router.post("/stealth/withdraw", async (req, res): Promise<void> => {
       .set({ nullifier, withdrawTxSig: txSig })
       .where(eq(stealthPendingTable.id, row.id));
 
-    req.log.info({ commitment, recipient, txSig, amountSol }, "StealthSend withdrawal completed");
+    req.log.info({ commitment, recipient, txSig, amountSol, feeLamports: feeLamports.toString(), netLamports: netLamports.toString() }, "StealthSend withdrawal completed");
     res.json({ success: true, txSig });
   } catch (err) {
     req.log.error({ err }, "StealthSend withdrawal error");
     res.status(500).json({ error: "Withdrawal failed" });
   }
 });
+
+// POST /stealth/zk-transfer
+// Privacy-preserving private_send: burns sSOL from pool, sends SOL to recipient.
+// Owner wallet does NOT appear in the transaction -- privacy guarantee.
+// The relayer uses the user's stoken_ata (random address, not wallet-derived).
 
 router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
   const parsed = ZkTransferBody.safeParse(req.body);
@@ -242,11 +323,6 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
   }
 
   const { wallet, amount, recipient, token, preimage } = parsed.data;
-
-  if (!relayerReady() || !relayerKeypair) {
-    res.status(503).json({ error: "Relay not configured, ZK transfer unavailable" });
-    return;
-  }
 
   try {
     const [vault] = await db
@@ -259,112 +335,282 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
       return;
     }
 
-    if (!vault.lastOts) {
-      res.status(400).json({ error: "Vault has no OTS tip. Re-initialize." });
+    if (SIM_MODE) {
+      const sToken = "s" + token;
+      const computed = createHash("sha256").update(Buffer.from(preimage, "hex")).digest("hex");
+      if (computed !== vault.lastOts) {
+        res.status(400).json({ error: "Vault code incorrect or wrong step." });
+        return;
+      }
+      const [balanceRow] = await db.select().from(vaultBalancesTable).where(and(eq(vaultBalancesTable.wallet, wallet), eq(vaultBalancesTable.token, sToken)));
+      const currentBalance = balanceRow ? parseFloat(balanceRow.shieldedAmount ?? "0") : 0;
+      if (currentBalance < amount) {
+        res.status(400).json({ error: `Insufficient shielded balance: have ${currentBalance.toFixed(4)}, need ${amount}` });
+        return;
+      }
+      const newDepth = Math.max(0, (vault.chainDepth ?? 1) - 1);
+      const txSig = simSig();
+      try {
+        await db.update(vaultsTable).set({ lastOts: preimage, chainDepth: newDepth }).where(eq(vaultsTable.wallet, wallet));
+        await db.insert(transactionsTable).values({ wallet, signature: txSig, type: "zk-transfer", token: sToken, amount: amount.toFixed(9), status: "confirmed" });
+        await upsertStealthBalance(wallet, sToken, -amount);
+      } catch (dbErr) {
+        req.log.warn({ dbErr }, "zk-transfer sim: DB update failed");
+      }
+      req.log.info({ wallet, amount, recipient, newDepth }, "zk-transfer: sim mode completed");
+      res.json({ success: true, txSig, newChainDepth: newDepth, sim: true });
       return;
     }
 
-    if (vault.chainDepth <= 0) {
-      res.status(400).json({ error: "OTS chain exhausted. Vault depth is 0." });
+    if (!relayerReady() || !relayerKeypair) {
+      res.status(503).json({ error: "Relay not configured, ZK transfer unavailable" });
       return;
     }
 
-    // Off-chain pre-check: fast-fail before building the transaction.
+    // Pre-flight: relayer must have enough SOL to cover both TX fees + rent-exempt minimum.
+    // Minimum = rent-exempt (890_880) + TX1 fee (~25_000) + TX2 fee (~25_000) + margin.
+    // Reject early so sSOL is never burned if TX2 would fail due to low relayer balance.
+    const RELAYER_MIN_LAMPORTS = 10_000_000; // 0.01 SOL safety threshold
+    const relayerBalance = await getConnection().getBalance(relayerKeypair.publicKey, "confirmed");
+    if (relayerBalance < RELAYER_MIN_LAMPORTS) {
+      req.log.error({ relayerBalance, threshold: RELAYER_MIN_LAMPORTS }, "ZK transfer rejected: relayer balance too low");
+      res.status(503).json({ error: "Relay temporarily unavailable, please try again shortly." });
+      return;
+    }
+
+    if (!vault.stokenAccount || !vault.mint) {
+      res.status(400).json({ error: "Vault missing on-chain token accounts. Close and re-shield to enable private send." });
+      return;
+    }
+
+    // Verify against on-chain state (source of truth), not DB -- DB may be stale after failed txs
+    const conn = getConnection();
+    const stokenAtaPk = new PublicKey(vault.stokenAccount);
+    const onchainState = await fetchUserState(conn, stokenAtaPk);
+
+    if (!onchainState) {
+      res.status(400).json({ error: "On-chain vault not found. Re-shield first." });
+      return;
+    }
+
+    if (onchainState.chainDepth <= 0) {
+      res.status(400).json({ error: "OTS chain exhausted on-chain. Refresh first." });
+      return;
+    }
+
+    const onchainTip = Buffer.from(onchainState.currentOtsHash).toString("hex");
     const computed = createHash("sha256").update(Buffer.from(preimage, "hex")).digest("hex");
-    if (computed !== vault.lastOts) {
-      req.log.warn({ wallet, computed, tip: vault.lastOts }, "ZK transfer: OTS pre-image mismatch");
-      res.status(400).json({ error: "Invalid vault code. OTS pre-image does not match." });
+
+    if (computed !== onchainTip) {
+      // Sync DB to on-chain so future attempts use correct state
+      await db
+        .update(vaultsTable)
+        .set({ lastOts: onchainTip, chainDepth: onchainState.chainDepth })
+        .where(eq(vaultsTable.wallet, wallet));
+      req.log.warn({ wallet, computed, onchainTip, dbTip: vault.lastOts, onchainDepth: onchainState.chainDepth }, "ZK transfer: OTS mismatch vs on-chain, DB re-synced");
+      res.status(400).json({ error: "Vault code incorrect or wrong step. Vault state re-synced, try again." });
       return;
     }
 
     const sToken = "s" + token;
-    const [balanceRow] = await db
-      .select()
-      .from(vaultBalancesTable)
-      .where(and(eq(vaultBalancesTable.wallet, wallet), eq(vaultBalancesTable.token, sToken)));
 
-    const currentBalance = balanceRow ? parseFloat(balanceRow.shieldedAmount ?? "0") : 0;
-    if (currentBalance < amount) {
-      res.status(400).json({ error: `Insufficient shielded balance: have ${currentBalance.toFixed(4)}, need ${amount}` });
+    // Use on-chain deposited amount as the source of truth for balance.
+    // vault_balances is only updated in SIM mode; on-chain state is always accurate.
+    const onchainBalance = Number(onchainState.deposited) / LAMPORTS_PER_SOL;
+    if (onchainBalance < amount) {
+      res.status(400).json({ error: `Insufficient shielded balance: have ${onchainBalance.toFixed(4)} SOL on-chain, need ${amount}` });
       return;
     }
 
-    // Require on-chain accounts. Vaults missing mint or stokenAccount were
-    // created in an older flow and cannot use zk_unshield.
-    if (!vault.mint || !vault.stokenAccount) {
-      res.status(400).json({
-        error: "Vault missing on-chain token accounts. Close and re-initialize the vault to enable ZK transfer.",
-      });
-      return;
-    }
-
-    const ownerPk      = new PublicKey(wallet);
-    const relayPk      = relayerKeypair.publicKey;
-    const mintPk       = new PublicKey(vault.mint);
-    const stokenAtaPk  = new PublicKey(vault.stokenAccount);
-    const recipientPk  = new PublicKey(recipient);
+    const relayPk = relayerKeypair.publicKey;
+    const mintPk = new PublicKey(vault.mint);
+    const recipientPk = new PublicKey(recipient);
     const amountLamports = BigInt(Math.round(amount * LAMPORTS_PER_SOL));
-
-    // Build the on-chain zk_unshield instruction.
-    // This burns sSOL on-chain via vault PDA delegate authority and sends SOL
-    // from the vault PDA to the recipient. The owner wallet does NOT sign.
-    const ix = buildZkUnshieldIx(
-      relayPk,
-      ownerPk,
-      mintPk,
-      stokenAtaPk,
-      recipientPk,
-      { otsPreimage: Buffer.from(preimage, "hex"), amount: amountLamports },
-    );
-
-    const conn = getConnection();
-    const tx = await buildVersionedTx(conn, relayPk, [ix]);
-    tx.sign([relayerKeypair]);
-
-    const rawBase64 = Buffer.from(tx.serialize()).toString("base64");
     const url = heliusRpcUrl();
 
-    const rpcRes = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        method: "sendTransaction",
-        params: [rawBase64, { encoding: "base64", preflightCommitment: "confirmed" }],
-        id: 1,
-      }),
-      signal: AbortSignal.timeout(15000),
-    });
-
-    const rpcData = (await rpcRes.json()) as { result?: string; error?: { message: string } };
-
-    if (rpcData.error || !rpcData.result) {
-      req.log.error({ err: rpcData.error }, "ZK transfer broadcast failed");
-      res.status(400).json({ error: rpcData.error?.message ?? "Broadcast failed" });
-      return;
+    // Helper: broadcast a signed versioned transaction and return the signature
+    async function broadcastTx(tx: VersionedTransaction): Promise<string> {
+      const rawBase64 = Buffer.from(tx.serialize()).toString("base64");
+      const rpcRes = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "sendTransaction",
+          params: [rawBase64, { encoding: "base64", preflightCommitment: "confirmed" }],
+          id: 1,
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const rpcData = (await rpcRes.json()) as { result?: string; error?: { message: string } };
+      if (rpcData.error || !rpcData.result) throw new Error(rpcData.error?.message ?? "Broadcast failed");
+      return rpcData.result;
     }
 
-    const txSig = rpcData.result;
+    // Helper: confirm a transaction by polling until confirmed or timeout.
+    // Each poll attempt retries up to 3 times on transient network errors
+    // (ECONNRESET, timeout) before counting as a failed attempt.
+    async function confirmTx(sig: string, maxAttempts = 20): Promise<void> {
+      for (let i = 0; i < maxAttempts; i++) {
+        let status: { confirmationStatus?: string; err?: unknown } | null | undefined;
+        let fetchOk = false;
 
-    // Update DB after confirmed on-chain broadcast.
-    // The on-chain instruction is the authoritative source:
-    //   - sSOL burned on-chain by vault PDA delegate
-    //   - OTS chain advanced on-chain
-    //   - SOL sent from vault PDA to recipient on-chain
-    // The DB update here mirrors the on-chain state for fast UI reads.
-    const newDepth = vault.chainDepth - 1;
+        for (let retry = 0; retry < 3; retry++) {
+          try {
+            const statusRes = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                method: "getSignatureStatuses",
+                params: [[sig], { searchTransactionHistory: true }],
+                id: 1,
+              }),
+              signal: AbortSignal.timeout(12000),
+            });
+            const statusData = (await statusRes.json()) as {
+              result?: { value: Array<{ confirmationStatus?: string; err?: unknown } | null> };
+            };
+            status = statusData.result?.value?.[0];
+            fetchOk = true;
+            break;
+          } catch (fetchErr) {
+            const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+            req.log.warn({ sig, attempt: i, retry, msg }, "confirmTx: fetch error, retrying");
+            await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+          }
+        }
+
+        if (!fetchOk) {
+          // All retries failed for this poll attempt, wait and try again next iteration
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+
+        if (status?.err) throw new Error("Transaction failed on-chain: " + JSON.stringify(status.err));
+        if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") return;
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      throw new Error("Transaction confirmation timeout");
+    }
+
+    // 2-TX StealthSend flow:
+    // TX1: [fund_fresh_relayer, burn_and_queue] signed by relayer + freshWallet
+    //   - fund_fresh_relayer: FunderPDA -> freshWallet (gas for TX1)
+    //   - burn_and_queue: freshWallet signs, burns sSOL -- NO recipient on-chain
+    // TX2: process_queue signed by relayer alone
+    //   - pool_pda -> recipient (NO link to TX1 on-chain)
+    // Zero common accounts between TX1 and TX2.
+
+    const GAS_LAMPORTS = BigInt(1_000_000); // rent exempt (890_880) + tx fee margin
+    const freshWallet = Keypair.generate();
+    const freshPk = freshWallet.publicKey;
+
+    req.log.info({ wallet, freshWallet: freshPk.toBase58() }, "ZK 2TX: fresh wallet generated");
+
+    // Mix layer: pick decoy ATAs and pass them as remaining_accounts directly
+    // into burn_and_queue. All N+1 burns (real + decoys) execute inside the SAME
+    // instruction, appearing as one "Interact" block in the block explorer.
+    // TX layout: fundIx + burnIx (2 instructions). ~1186 raw bytes with 20 decoys.
+    const decoyRows = await pickAndReserveDecoys(MIX_ZK_DECOYS);
+    let decoyIds = decoyRows.map((r) => r.id);
+    let decoyAtaPks = decoyRows.map((r) => new PublicKey(r.stokenAta));
+
+    // Validate decoy accounts exist on-chain before including in burn TX.
+    // Prevents InvalidAccountData if a decoy_shield TX was dropped and the
+    // account never actually landed on Solana.
+    if (decoyAtaPks.length > 0) {
+      const infos = await conn.getMultipleAccountsInfo(decoyAtaPks).catch(() => null);
+      if (infos) {
+        const invalidIds = decoyIds.filter((_, i) => infos[i] === null);
+        if (invalidIds.length > 0) {
+          req.log.warn({ invalidCount: invalidIds.length, total: decoyAtaPks.length }, "zk-transfer: dropping non-existent decoy accounts, marking depleted");
+          await markDecoysDepeleted(invalidIds);
+          decoyAtaPks = decoyAtaPks.filter((_, i) => infos[i] !== null);
+          decoyIds = decoyIds.filter((_, i) => infos[i] !== null);
+        }
+      }
+    }
+
+    const fundIx = buildFundFreshRelayerIx(relayPk, freshPk, GAS_LAMPORTS);
+    const burnIx = buildBurnAndQueueIx(
+      freshPk,
+      mintPk,
+      stokenAtaPk,
+      { otsPreimage: Buffer.from(preimage, "hex"), amount: amountLamports },
+      decoyAtaPks,
+    );
+
+    req.log.info({ wallet, decoyCount: decoyRows.length }, "ZK 1TX: real burn + " + decoyRows.length + " decoy burns in same instruction");
+    const tx1Ixs = [fundIx, burnIx];
+
+    let tx1Sig: string;
+    try {
+      const tx1 = await buildVersionedTx(conn, relayPk, tx1Ixs);
+      tx1.sign([relayerKeypair, freshWallet]);
+      tx1Sig = await broadcastTx(tx1);
+    } catch (txErr) {
+      const msg = txErr instanceof Error ? txErr.message : String(txErr);
+      req.log.warn({ txErr }, "ZK 1TX: burn_and_queue failed");
+      await releaseDecoys(decoyIds);
+      res.status(400).json({ error: `On-chain burn failed: ${msg}` });
+      return;
+    }
+    req.log.info({ tx1Sig, freshWallet: freshPk.toBase58() }, "ZK 1TX: burn broadcast (burn_and_queue)");
+
+    await confirmTx(tx1Sig);
+    req.log.info({ tx1Sig }, "ZK 2TX: TX1 confirmed");
+    await markDecoysDepeleted(decoyIds);
+
+    // TX2: process_queue (relayer only, recipient appears here only)
+    const processIx = buildProcessQueueIx(relayPk, recipientPk, amountLamports);
+    const tx2 = await buildVersionedTx(conn, relayPk, [processIx]);
+    tx2.sign([relayerKeypair]);
+    const tx2Sig = await broadcastTx(tx2);
+    req.log.info({ tx2Sig, recipient }, "ZK 2TX: TX2 broadcast (process_queue)");
+
+    await confirmTx(tx2Sig);
+    req.log.info({ tx2Sig, recipient, amount }, "ZK 2TX: TX2 confirmed, SOL delivered to recipient");
+
+    // Best-effort: return any remaining SOL from freshWallet to FunderPDA
+    // Fire-and-forget -- do not await, do not let failure block the response
+    void (async () => {
+      try {
+        const freshBalance = await conn.getBalance(freshPk, "confirmed");
+        if (freshBalance > 5000) {
+          const returnLamports = freshBalance - 5000;
+          const { blockhash } = await conn.getLatestBlockhash("confirmed");
+          const returnMsg = new TransactionMessage({
+            payerKey: freshPk,
+            recentBlockhash: blockhash,
+            instructions: [
+              SystemProgram.transfer({
+                fromPubkey: freshPk,
+                toPubkey: new PublicKey("EvdRpV1Vn5qGmxnqHS3NVQgo341kvRqXsU1WCYUwqhHg"),
+                lamports: BigInt(returnLamports),
+              }),
+            ],
+          }).compileToV0Message();
+          const returnTx = new VersionedTransaction(returnMsg);
+          returnTx.sign([freshWallet]);
+          await broadcastTx(returnTx);
+          req.log.info({ returnLamports, freshWallet: freshPk.toBase58() }, "ZK 2TX: freshWallet SOL returned to FunderPDA");
+        }
+      } catch (returnErr) {
+        req.log.warn({ returnErr }, "ZK 2TX: freshWallet SOL return failed (non-critical)");
+      }
+    })();
+
+    const txSig = tx2Sig;
+    const newDepth = onchainState.chainDepth - 1;
     await db
       .update(vaultsTable)
       .set({ lastOts: preimage, chainDepth: newDepth })
       .where(eq(vaultsTable.wallet, wallet));
 
-    const newBalance = Math.max(0, currentBalance - amount);
-    if (balanceRow) {
-      await db
-        .update(vaultBalancesTable)
-        .set({ shieldedAmount: newBalance.toFixed(9) })
-        .where(eq(vaultBalancesTable.id, balanceRow.id));
-    }
+    // On-chain UserState.deposited is the source of truth (decremented by burn_and_queue).
+    // Also update DB balance row so vault_balances fallback path stays consistent.
+    await upsertStealthBalance(wallet, sToken, -amount);
 
     await db.insert(transactionsTable).values({
       wallet,
@@ -375,8 +621,8 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
       status: "confirmed",
     });
 
-    req.log.info({ wallet, recipient, txSig, amount, token: sToken, newDepth }, "ZK transfer completed: sSOL burned on-chain");
-    res.json({ success: true, txSig });
+    req.log.info({ wallet, recipient, tx1Sig, txSig, amount, token: sToken, newDepth }, "ZK 2TX: StealthSend complete, sSOL burned TX1, SOL delivered TX2");
+    res.json({ success: true, txSig, tx1Sig });
   } catch (err) {
     req.log.error({ err }, "ZK transfer error");
     res.status(500).json({ error: "ZK transfer failed" });
