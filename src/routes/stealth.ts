@@ -101,6 +101,7 @@ const ZkTransferBody = z.object({
   recipient: z.string().min(32).max(44),
   token: z.string().min(1).max(16),
   preimage: z.string().length(64),
+  stokenAccount: z.string().min(32).max(44).optional(),
 });
 
 router.get("/stealth-pending/:wallet", async (req, res): Promise<void> => {
@@ -322,13 +323,17 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
     return;
   }
 
-  const { wallet, amount, recipient, token, preimage } = parsed.data;
+  const { wallet, amount, recipient, token, preimage, stokenAccount: stokenAccountParam } = parsed.data;
 
   try {
     const [vault] = await db
       .select()
       .from(vaultsTable)
-      .where(eq(vaultsTable.wallet, wallet));
+      .where(
+        stokenAccountParam
+          ? and(eq(vaultsTable.wallet, wallet), eq(vaultsTable.stokenAccount, stokenAccountParam))
+          : eq(vaultsTable.wallet, wallet),
+      );
 
     if (!vault) {
       res.status(404).json({ error: "Vault not found" });
@@ -370,7 +375,7 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
     // Pre-flight: relayer must have enough SOL to cover both TX fees + rent-exempt minimum.
     // Minimum = rent-exempt (890_880) + TX1 fee (~25_000) + TX2 fee (~25_000) + margin.
     // Reject early so sSOL is never burned if TX2 would fail due to low relayer balance.
-    const RELAYER_MIN_LAMPORTS = 10_000_000; // 0.01 SOL safety threshold
+    const RELAYER_MIN_LAMPORTS = 2_000_000; // 0.002 SOL safety threshold (~2x actual minimum)
     const relayerBalance = await getConnection().getBalance(relayerKeypair.publicKey, "confirmed");
     if (relayerBalance < RELAYER_MIN_LAMPORTS) {
       req.log.error({ relayerBalance, threshold: RELAYER_MIN_LAMPORTS }, "ZK transfer rejected: relayer balance too low");
@@ -516,6 +521,10 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
     let decoyIds = decoyRows.map((r) => r.id);
     let decoyAtaPks = decoyRows.map((r) => new PublicKey(r.stokenAta));
 
+    if (decoyRows.length === 0) {
+      req.log.warn({ wallet }, "zk-transfer: no decoy accounts available in mix pool, proceeding with reduced anonymity set");
+    }
+
     // Validate decoy accounts exist on-chain before including in burn TX.
     // Prevents InvalidAccountData if a decoy_shield TX was dropped and the
     // account never actually landed on Solana.
@@ -563,11 +572,19 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
     await markDecoysDepeleted(decoyIds);
 
     // TX2: process_queue (relayer only, recipient appears here only)
-    const processIx = buildProcessQueueIx(relayPk, recipientPk, amountLamports);
-    const tx2 = await buildVersionedTx(conn, relayPk, [processIx]);
+    // 0.15% relayer fee (15 basis points). Two instructions in the same TX2:
+    // Ix1: pool -> recipient  (amountLamports - fee)
+    // Ix2: pool -> relayer    (fee)
+    // Total deducted from pool equals the full amountLamports burned in TX1.
+    const fee = amountLamports * 15n / 10_000n;
+    const recipientAmount = amountLamports - fee;
+
+    const processIx = buildProcessQueueIx(relayPk, recipientPk, recipientAmount);
+    const feeIx     = buildProcessQueueIx(relayPk, relayPk, fee);
+    const tx2 = await buildVersionedTx(conn, relayPk, [processIx, feeIx]);
     tx2.sign([relayerKeypair]);
     const tx2Sig = await broadcastTx(tx2);
-    req.log.info({ tx2Sig, recipient }, "ZK 2TX: TX2 broadcast (process_queue)");
+    req.log.info({ tx2Sig, recipient, fee: fee.toString(), recipientAmount: recipientAmount.toString() }, "ZK 2TX: TX2 broadcast (process_queue)");
 
     await confirmTx(tx2Sig);
     req.log.info({ tx2Sig, recipient, amount }, "ZK 2TX: TX2 confirmed, SOL delivered to recipient");

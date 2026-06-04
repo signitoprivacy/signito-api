@@ -147,6 +147,20 @@ const SIM_MODE = process.env.SIM_MODE === "true";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// Block well-known Solana program addresses from being used as user wallets.
+// System Program is the most common test/abuse vector; block it at schema level
+// to prevent orphaned DB records (DoS via pending-shield flooding).
+const BLOCKED_SOLANA_ADDRESSES = new Set([
+  "11111111111111111111111111111111", // System Program
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // Token Program
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe8bv", // Associated Token Account Program
+]);
+const solanaWalletField = z
+  .string()
+  .min(32)
+  .max(44)
+  .refine((w) => !BLOCKED_SOLANA_ADDRESSES.has(w), { message: "Invalid wallet address" });
+
 function sha256Hex(hex: string): string {
   return createHash("sha256").update(Buffer.from(hex, "hex")).digest("hex");
 }
@@ -303,7 +317,7 @@ function prunePending() {
 // ─── Zod schemas ──────────────────────────────────────────────────────────────
 
 const PrepareShieldBody = z.object({
-  wallet: z.string().min(32).max(44),
+  wallet: solanaWalletField,
   codeHash: z.string().length(64),
   amount: z.number().positive(),
   chainDepth: z.number().int().min(1).max(256).default(32),
@@ -311,32 +325,36 @@ const PrepareShieldBody = z.object({
 
 const ConfirmShieldBody = z.object({
   pendingId: z.string().length(32),
-  wallet: z.string().min(32).max(44),   // user's real wallet = display_owner
-  transferSig: z.string().min(64).optional(), // sig of the SOL transfer tx (on-chain check)
+  wallet: solanaWalletField,
+  transferSig: z.string().min(64).optional(),
 });
 
 const PrepareDepositBody = z.object({
-  wallet: z.string().min(32).max(44),
+  wallet: solanaWalletField,
   amount: z.number().positive(),
 });
 
 const ConfirmDepositBody = z.object({
   pendingId: z.string().length(32),
-  wallet: z.string().min(32).max(44),   // user's real wallet = display_owner
+  wallet: solanaWalletField,
   transferSig: z.string().min(64).optional(),
 });
 
 const PrivateSendBody = z.object({
-  wallet: z.string().min(32).max(44),
+  wallet: solanaWalletField,
   amount: z.number().positive(),
-  destination: z.string().min(32).max(44),
+  destination: solanaWalletField,
   preimage: z.string().length(64),
   token: z.string().min(1).max(16).optional(),
+  stokenAccount: z.string().min(32).max(44).optional(),
 });
 
 const PrepareRefreshBody = z.object({
-  wallet: z.string().min(32).max(44),
+  wallet: solanaWalletField,
   newOtsTip: z.string().length(64),
+  // otsPreimage: current vault code's preimage -- authenticates the change server-side.
+  // Required when an on-chain vault exists. Mirrors the Base refreshOts on-chain check.
+  otsPreimage: z.string().length(64).optional(),
   chainDepth: z.number().int().min(8).max(128).default(32),
 });
 
@@ -1352,13 +1370,17 @@ router.post("/vault/unshield", async (req, res): Promise<void> => {
     return;
   }
 
-  const { wallet, amount, destination, preimage, token } = parsed.data;
+  const { wallet, amount, destination, preimage, token, stokenAccount: stokenAccountParam } = parsed.data;
 
   try {
     const [vault] = await db
       .select()
       .from(vaultsTable)
-      .where(eq(vaultsTable.wallet, wallet));
+      .where(
+        stokenAccountParam
+          ? and(eq(vaultsTable.wallet, wallet), eq(vaultsTable.stokenAccount, stokenAccountParam))
+          : eq(vaultsTable.wallet, wallet),
+      );
 
     if (!vault) {
       res.status(404).json({ error: "Vault not found" });
@@ -1440,6 +1462,10 @@ router.post("/vault/unshield", async (req, res): Promise<void> => {
     let decoyIds = decoyRows.map((r) => r.id);
     let decoyAtaPks = decoyRows.map((r) => new PublicKey(r.stokenAta));
 
+    if (decoyRows.length === 0) {
+      req.log.warn({ wallet }, "unshield: no decoy accounts available in mix pool, proceeding with reduced anonymity set");
+    }
+
     // Validate decoy accounts exist on-chain before including in burn TX.
     // Prevents InvalidAccountData if a decoy_shield TX was dropped and the
     // account never actually landed on Solana.
@@ -1501,11 +1527,19 @@ router.post("/vault/unshield", async (req, res): Promise<void> => {
     // Mark decoy accounts as depleted after successful burn confirmation
     await markDecoysDepeleted(decoyIds);
 
-    const processIx = buildProcessQueueIx(relayerKeypair.publicKey, destPk, amountLamports);
+    // 0.15% relayer fee (15 basis points). Two processQueue instructions in the same TX2:
+    // Ix1: pool -> recipient  (amountLamports - fee)
+    // Ix2: pool -> relayer    (fee)
+    // Total deducted from pool equals the full amountLamports that was burned in TX1.
+    const fee = amountLamports * 15n / 10_000n;
+    const recipientAmount = amountLamports - fee;
+
+    const processIx = buildProcessQueueIx(relayerKeypair.publicKey, destPk, recipientAmount);
+    const feeIx = buildProcessQueueIx(relayerKeypair.publicKey, relayerKeypair.publicKey, fee);
 
     let tx2Sig: string;
     try {
-      const tx2 = await buildVersionedTx(conn, relayerKeypair.publicKey, [processIx]);
+      const tx2 = await buildVersionedTx(conn, relayerKeypair.publicKey, [processIx, feeIx]);
       tx2.sign([relayerKeypair]);
       tx2Sig = await conn.sendRawTransaction(tx2.serialize(), { skipPreflight: false, preflightCommitment: "confirmed" });
     } catch (txErr) {
@@ -1515,7 +1549,7 @@ router.post("/vault/unshield", async (req, res): Promise<void> => {
       return;
     }
 
-    req.log.info({ wallet, tx1Sig, tx2Sig, destination, amount }, "unshield 2TX: TX2 broadcast");
+    req.log.info({ wallet, tx1Sig, tx2Sig, destination, amount, fee: fee.toString(), recipientAmount: recipientAmount.toString() }, "unshield 2TX: TX2 broadcast");
 
     const newDepth = onchainState.chainDepth - 1;
     const sToken = token ? "s" + token : null;
@@ -1569,12 +1603,37 @@ router.post("/vault/prepare-refresh", async (req, res): Promise<void> => {
     return;
   }
 
-  const { wallet, newOtsTip, chainDepth } = parsed.data;
+  const { wallet, newOtsTip, chainDepth, otsPreimage } = parsed.data;
 
   try {
     const [vault] = await db.select().from(vaultsTable).where(eq(vaultsTable.wallet, wallet));
     if (!vault || !vault.stokenAccount) {
       res.status(404).json({ error: "Vault not found or missing sToken account." });
+      return;
+    }
+
+    // Authenticate the vault code change: require old OTS preimage that matches the current
+    // on-chain tip. This prevents an unauthenticated caller from replacing the OTS chain.
+    // Same security model as Base's refreshOts contract check, applied server-side here.
+    if (!otsPreimage) {
+      res.status(400).json({ error: "Current vault code required to change vault code." });
+      return;
+    }
+    try {
+      const verifyConn = getConnection();
+      const verifyAtaPk = new PublicKey(vault.stokenAccount);
+      const onchainState = await fetchUserState(verifyConn, verifyAtaPk);
+      if (onchainState) {
+        const computed = sha256Hex(otsPreimage);
+        const onchainTip = Buffer.from(onchainState.currentOtsHash).toString("hex");
+        if (computed !== onchainTip) {
+          res.status(401).json({ error: "Current vault code incorrect." });
+          return;
+        }
+      }
+    } catch (verifyErr) {
+      req.log.warn({ verifyErr }, "prepare-refresh: on-chain OTS verify failed (RPC error), rejecting to be safe");
+      res.status(503).json({ error: "Cannot verify vault code: RPC unavailable. Try again." });
       return;
     }
 

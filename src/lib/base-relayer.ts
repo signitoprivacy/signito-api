@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient, http } from "viem";
+import { createPublicClient, createWalletClient, http, fallback } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { baseSepolia, base } from "viem/chains";
 import { logger } from "./logger.js";
@@ -15,26 +15,29 @@ const SHETH_ADDRESS = process.env.BASE_SHETH_ADDRESS as `0x${string}` | undefine
 const IS_MAINNET = process.env.BASE_NETWORK === "mainnet";
 const chain = IS_MAINNET ? base : baseSepolia;
 
-// For mainnet: use Flashbots Protect RPC to keep sensitive TXs out of the public mempool.
-// hint=none means the TX is not shared with MEV searchers at all.
-// For testnet: use the public RPC (Flashbots does not support Base Sepolia).
-const FLASHBOTS_RPC = "https://rpc.flashbots.net?hint=none";
+// Primary: BASE_RPC_URL (Alchemy). Fallback: public Base RPC if Alchemy fails.
+const BASE_PUBLIC_RPC = "https://mainnet.base.org";
 const SEPOLIA_RPC = process.env.BASE_SEPOLIA_RPC_URL ?? "https://sepolia.base.org";
+const BASE_RPC_URL = process.env.BASE_RPC_URL;
 
-const publicRpcUrl = IS_MAINNET ? FLASHBOTS_RPC : SEPOLIA_RPC;
+function makeTransport(isMainnet: boolean) {
+  if (isMainnet && BASE_RPC_URL) {
+    return fallback([http(BASE_RPC_URL), http(BASE_PUBLIC_RPC)]);
+  }
+  return http(isMainnet ? BASE_PUBLIC_RPC : SEPOLIA_RPC);
+}
 
 export const basePublicClient = createPublicClient({
   chain,
-  transport: http(publicRpcUrl),
+  transport: makeTransport(IS_MAINNET),
 });
 
 export function getBaseWalletClient() {
   if (!RAW_KEY) throw new Error("BASE_RELAYER_PRIVATE_KEY not set");
   const key = (RAW_KEY.startsWith("0x") ? RAW_KEY : `0x${RAW_KEY}`) as `0x${string}`;
   const account = privateKeyToAccount(key);
-  const rpcUrl = IS_MAINNET ? FLASHBOTS_RPC : SEPOLIA_RPC;
   return {
-    client: createWalletClient({ account, chain, transport: http(rpcUrl) }),
+    client: createWalletClient({ account, chain, transport: makeTransport(IS_MAINNET) }),
     account,
   };
 }
@@ -72,6 +75,18 @@ export const POOL_ABI = [
     outputs: [],
   },
   {
+    name: "shieldWithDecoys",
+    type: "function",
+    stateMutability: "payable",
+    inputs: [
+      { name: "stokenAddress", type: "address" },
+      { name: "initialOtsHash", type: "bytes32" },
+      { name: "chainDepth", type: "uint8" },
+      { name: "allAccounts", type: "address[]" },
+    ],
+    outputs: [],
+  },
+  {
     name: "batchAdminMint",
     type: "function",
     stateMutability: "nonpayable",
@@ -86,7 +101,6 @@ export const POOL_ABI = [
     type: "function",
     stateMutability: "nonpayable",
     inputs: [
-      { name: "stokenAddress", type: "address" },
       { name: "amount", type: "uint256" },
       { name: "otsPreimage", type: "bytes32" },
       { name: "allBurnAccounts", type: "address[]" },
