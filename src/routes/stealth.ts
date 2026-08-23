@@ -4,7 +4,7 @@ import { db, stealthPendingTable, vaultsTable, vaultBalancesTable, transactionsT
 import { eq, and, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import { Keypair, PublicKey, SystemProgram, LAMPORTS_PER_SOL, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
-import { getConnection, relayerKeypair, relayerReady } from "../lib/relayer.js";
+import { getConnection, relayerKeypair, relayerReady, waitForSolanaSignature } from "../lib/relayer.js";
 import { heliusRpcUrl } from "../lib/rpc.js";
 import {
   buildVersionedTx,
@@ -12,8 +12,10 @@ import {
   buildFundFreshRelayerIx,
   buildBurnAndQueueIx,
   buildProcessQueueIx,
+  deriveFunderPda,
   fetchUserState,
 } from "@workspace/program";
+import { provisionMixDecoys } from "../lib/mix-pool-worker.js";
 
 const router: IRouter = Router();
 
@@ -26,15 +28,23 @@ const MIX_ZK_DECOYS = Number(process.env.MIX_ZK_DECOYS ?? "20");
 
 
 // Pick available decoy accounts and atomically mark them in_use.
-async function pickAndReserveDecoys(count: number): Promise<Array<{ id: number; stokenAta: string }>> {
+async function pickAndReserveDecoys(
+  count: number,
+  amountLamports: bigint,
+): Promise<Array<{ id: number; stokenAta: string }>> {
   if (count <= 0) return [];
   try {
-    const available = await db
-      .select({ id: mixWalletsTable.id, stokenAta: mixWalletsTable.stokenAta })
+    const available = (await db
+      .select({
+        id: mixWalletsTable.id,
+        stokenAta: mixWalletsTable.stokenAta,
+        amountLamports: mixWalletsTable.amountLamports,
+      })
       .from(mixWalletsTable)
-      .where(eq(mixWalletsTable.status, "available"))
-      .limit(count);
-    if (available.length === 0) return [];
+      .where(eq(mixWalletsTable.status, "available")))
+      .filter((row) => BigInt(row.amountLamports) >= amountLamports)
+      .slice(0, count);
+    if (available.length !== count) return [];
     const ids = available.map((r) => r.id);
     await db
       .update(mixWalletsTable)
@@ -49,6 +59,33 @@ async function pickAndReserveDecoys(count: number): Promise<Array<{ id: number; 
     return [];
   }
 }
+
+async function countUsableDecoys(amountLamports: bigint): Promise<number> {
+  const rows = await db
+    .select({ amountLamports: mixWalletsTable.amountLamports })
+    .from(mixWalletsTable)
+    .where(eq(mixWalletsTable.status, "available"));
+  return rows.filter((row) => BigInt(row.amountLamports) >= amountLamports).length;
+}
+
+router.get("/stealth/zk-readiness", async (req, res): Promise<void> => {
+  const rawAmount = typeof req.query.amountLamports === "string" ? req.query.amountLamports : "";
+  if (!/^\d+$/.test(rawAmount)) {
+    res.status(400).json({ error: "amountLamports must be a non-negative integer" });
+    return;
+  }
+  try {
+    const availableDecoys = await countUsableDecoys(BigInt(rawAmount));
+    res.json({
+      ready: availableDecoys >= MIX_ZK_DECOYS,
+      availableDecoys,
+      requiredDecoys: MIX_ZK_DECOYS,
+    });
+  } catch (err) {
+    req.log.error({ err }, "zk-readiness error");
+    res.status(503).json({ error: "Could not check Solana privacy-set readiness." });
+  }
+});
 
 async function markDecoysDepeleted(ids: number[]): Promise<void> {
   if (ids.length === 0) return;
@@ -452,51 +489,10 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
       return rpcData.result;
     }
 
-    // Helper: confirm a transaction by polling until confirmed or timeout.
-    // Each poll attempt retries up to 3 times on transient network errors
-    // (ECONNRESET, timeout) before counting as a failed attempt.
-    async function confirmTx(sig: string, maxAttempts = 20): Promise<void> {
-      for (let i = 0; i < maxAttempts; i++) {
-        let status: { confirmationStatus?: string; err?: unknown } | null | undefined;
-        let fetchOk = false;
-
-        for (let retry = 0; retry < 3; retry++) {
-          try {
-            const statusRes = await fetch(url, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                jsonrpc: "2.0",
-                method: "getSignatureStatuses",
-                params: [[sig], { searchTransactionHistory: true }],
-                id: 1,
-              }),
-              signal: AbortSignal.timeout(12000),
-            });
-            const statusData = (await statusRes.json()) as {
-              result?: { value: Array<{ confirmationStatus?: string; err?: unknown } | null> };
-            };
-            status = statusData.result?.value?.[0];
-            fetchOk = true;
-            break;
-          } catch (fetchErr) {
-            const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-            req.log.warn({ sig, attempt: i, retry, msg }, "confirmTx: fetch error, retrying");
-            await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
-          }
-        }
-
-        if (!fetchOk) {
-          // All retries failed for this poll attempt, wait and try again next iteration
-          await new Promise((r) => setTimeout(r, 2000));
-          continue;
-        }
-
-        if (status?.err) throw new Error("Transaction failed on-chain: " + JSON.stringify(status.err));
-        if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") return;
-        await new Promise((r) => setTimeout(r, 1500));
-      }
-      throw new Error("Transaction confirmation timeout");
+    // Submitted signatures are reconciled at a fixed, low-rate cadence. A
+    // missing receipt is pending/unknown, never grounds for a duplicate send.
+    async function confirmTx(sig: string): Promise<void> {
+      await waitForSolanaSignature(conn, sig);
     }
 
     // 2-TX StealthSend flow:
@@ -517,12 +513,24 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
     // into burn_and_queue. All N+1 burns (real + decoys) execute inside the SAME
     // instruction, appearing as one "Interact" block in the block explorer.
     // TX layout: fundIx + burnIx (2 instructions). ~1186 raw bytes with 20 decoys.
-    const decoyRows = await pickAndReserveDecoys(MIX_ZK_DECOYS);
+    const usableDecoys = await countUsableDecoys(amountLamports);
+    if (usableDecoys < MIX_ZK_DECOYS) {
+      req.log.info(
+        { wallet, readyDecoys: usableDecoys, requiredDecoys: MIX_ZK_DECOYS },
+        "zk-transfer: preparing Solana privacy set",
+      );
+      await provisionMixDecoys(MIX_ZK_DECOYS - usableDecoys, amountLamports);
+    }
+
+    const decoyRows = await pickAndReserveDecoys(MIX_ZK_DECOYS, amountLamports);
     let decoyIds = decoyRows.map((r) => r.id);
     let decoyAtaPks = decoyRows.map((r) => new PublicKey(r.stokenAta));
 
-    if (decoyRows.length === 0) {
-      req.log.warn({ wallet }, "zk-transfer: no decoy accounts available in mix pool, proceeding with reduced anonymity set");
+    if (decoyRows.length !== MIX_ZK_DECOYS) {
+      res.status(503).json({
+        error: "Privacy-set preparation did not reach 20 funded decoys. No transaction was submitted.",
+      });
+      return;
     }
 
     // Validate decoy accounts exist on-chain before including in burn TX.
@@ -539,6 +547,13 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
           decoyIds = decoyIds.filter((_, i) => infos[i] !== null);
         }
       }
+    }
+    if (decoyAtaPks.length !== MIX_ZK_DECOYS) {
+      await releaseDecoys(decoyIds);
+      res.status(503).json({
+        error: "Privacy-set verification found unavailable decoys. No transaction was submitted.",
+      });
+      return;
     }
 
     const fundIx = buildFundFreshRelayerIx(relayPk, freshPk, GAS_LAMPORTS);
@@ -593,6 +608,7 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
     // Fire-and-forget -- do not await, do not let failure block the response
     void (async () => {
       try {
+        const [funderPda] = deriveFunderPda();
         const freshBalance = await conn.getBalance(freshPk, "confirmed");
         if (freshBalance > 5000) {
           const returnLamports = freshBalance - 5000;
@@ -603,7 +619,7 @@ router.post("/stealth/zk-transfer", async (req, res): Promise<void> => {
             instructions: [
               SystemProgram.transfer({
                 fromPubkey: freshPk,
-                toPubkey: new PublicKey("EvdRpV1Vn5qGmxnqHS3NVQgo341kvRqXsU1WCYUwqhHg"),
+                toPubkey: funderPda,
                 lamports: BigInt(returnLamports),
               }),
             ],

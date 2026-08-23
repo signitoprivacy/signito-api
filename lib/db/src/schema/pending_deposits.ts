@@ -1,6 +1,6 @@
 import { pgTable, text, serial, timestamp } from "drizzle-orm/pg-core";
 
-export const pendingDepositsTable = pgTable("pending_deposits", {
+export const pendingDepositsTable = pgTable("solana_v4_pending_deposits", {
   id: serial("id").primaryKey(),
   pendingId: text("pending_id").notNull().unique(),
   wallet: text("wallet").notNull(),

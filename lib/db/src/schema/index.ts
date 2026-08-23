@@ -10,3 +10,6 @@ export * from "./mix_wallets";
 export * from "./base_vaults";
 export * from "./base_stealth_pending";
 export * from "./base_mix_wallets";
+export * from "./ethereum_vaults";
+export * from "./ethereum_stealth_pending";
+export * from "./ethereum_mix_wallets";

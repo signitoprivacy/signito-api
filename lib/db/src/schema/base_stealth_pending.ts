@@ -8,9 +8,11 @@ export const baseStealthPendingTable = pgTable("base_stealth_pending", {
   stokenAddress: text("stoken_address").notNull(),
   amount: text("amount").notNull(),
   recipient: text("recipient").notNull(),
+  action: text("action").notNull().default("unshield"),
   burnTxHash: text("burn_tx_hash"),
   processTxHash: text("process_tx_hash"),
   status: text("status").notNull().default("pending"),
+  error: text("error"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

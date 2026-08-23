@@ -2,7 +2,7 @@ import { pgTable, text, serial, bigint, timestamp } from "drizzle-orm/pg-core";
 
 // Ephemeral pending shield records — persisted so keypairs survive server restarts.
 // Deleted on success or expiry. TTL enforced at application level.
-export const pendingShieldsTable = pgTable("pending_shields", {
+export const pendingShieldsTable = pgTable("solana_v4_pending_shields", {
   id: serial("id").primaryKey(),
   // Opaque random token returned to the client as the pending ID
   pendingId: text("pending_id").notNull().unique(),

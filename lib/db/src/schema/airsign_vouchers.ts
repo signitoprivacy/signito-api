@@ -2,7 +2,7 @@ import { pgTable, text, serial, numeric, timestamp } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
-export const airsignVouchersTable = pgTable("airsign_vouchers", {
+export const airsignVouchersTable = pgTable("solana_v4_airsign_vouchers", {
   id: serial("id").primaryKey(),
   issuerWallet: text("issuer_wallet").notNull(),
   recipient: text("recipient"),

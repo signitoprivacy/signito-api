@@ -1,10 +1,13 @@
 import { Keypair, PublicKey } from "@solana/web3.js";
+import { randomBytes } from "crypto";
 import { eq, sql } from "drizzle-orm";
 import { db, mixWalletsTable } from "@workspace/db";
 import {
+  buildDecoyShieldIx,
   buildCloseDecoyIx,
   buildVersionedTx,
   deriveUserStatePda,
+  fetchPoolState,
 } from "@workspace/program";
 import { getConnection, relayerKeypair } from "./relayer.js";
 import { logger } from "./logger.js";
@@ -19,6 +22,7 @@ const CLOSE_DECOY_BATCH = 10;                 // max pairs per close_decoy TX
 
 let isRefilling = false;
 let isClosing = false;
+const activeProvisioning = new Map<string, Promise<number>>();
 
 // ─── count ready keypairs ─────────────────────────────────────────────────────
 
@@ -54,6 +58,84 @@ async function generateKeypairs(count: number): Promise<number> {
     }
   }
   return generated;
+}
+
+/**
+ * Creates on-chain decoys for a private execution that cannot yet draw a full
+ * privacy set from the available pool. Every instruction is signed and funded
+ * by the operational relayer; no connected user wallet participates.
+ */
+export async function provisionMixDecoys(
+  count: number,
+  amountLamports: bigint,
+): Promise<number> {
+  if (count <= 0) return 0;
+  if (!relayerKeypair) throw new Error("Relayer is not configured.");
+
+  const key = amountLamports.toString();
+  const running = activeProvisioning.get(key);
+  if (running) return running;
+
+  const job = (async () => {
+    const conn = getConnection();
+    const poolState = await fetchPoolState(conn);
+    if (!poolState) throw new Error("Pool is not initialized.");
+
+    let created = 0;
+    for (let index = 0; index < count; index += 1) {
+      const decoyKp = Keypair.generate();
+      const displayOwnerKp = Keypair.generate();
+      const ix = buildDecoyShieldIx(
+        relayerKeypair.publicKey,
+        displayOwnerKp.publicKey,
+        poolState.mintStoken,
+        decoyKp.publicKey,
+        {
+          otsTip: randomBytes(32),
+          chainDepth: 8 + Math.floor(Math.random() * 57),
+          amount: amountLamports,
+        },
+      );
+
+      const tx = await buildVersionedTx(conn, relayerKeypair.publicKey, [ix]);
+      tx.sign([relayerKeypair, decoyKp, displayOwnerKp]);
+      const sig = await conn.sendRawTransaction(tx.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+      });
+
+      const deadline = Date.now() + 45_000;
+      let confirmed = false;
+      while (Date.now() < deadline) {
+        const status = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0];
+        if (status?.err) throw new Error(`Decoy preparation failed on-chain: ${JSON.stringify(status.err)}`);
+        if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") {
+          confirmed = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1_200));
+      }
+      if (!confirmed) throw new Error("Decoy preparation confirmation timed out.");
+
+      await db.insert(mixWalletsTable).values({
+        stokenAta: decoyKp.publicKey.toBase58(),
+        displayOwner: displayOwnerKp.publicKey.toBase58(),
+        displayOwnerSecret: Buffer.from(displayOwnerKp.secretKey).toString("base64"),
+        amountLamports: amountLamports.toString(),
+        status: "available",
+      }).onConflictDoNothing();
+      created += 1;
+      logger.info({ sig, created, requested: count }, "mix-worker: operational decoy prepared");
+    }
+    return created;
+  })();
+
+  activeProvisioning.set(key, job);
+  try {
+    return await job;
+  } finally {
+    activeProvisioning.delete(key);
+  }
 }
 
 // ─── recover stale in_use wallets (crashed mid-TX) ───────────────────────────

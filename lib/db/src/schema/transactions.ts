@@ -2,7 +2,7 @@ import { pgTable, text, serial, numeric, timestamp } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
-export const transactionsTable = pgTable("transactions", {
+export const transactionsTable = pgTable("solana_v4_transactions", {
   id: serial("id").primaryKey(),
   wallet: text("wallet").notNull(),
   signature: text("signature").notNull().unique(),

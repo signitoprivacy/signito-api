@@ -2,7 +2,7 @@ import { pgTable, text, serial, numeric, timestamp } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
-export const stealthPendingTable = pgTable("stealth_pending", {
+export const stealthPendingTable = pgTable("solana_v4_stealth_pending", {
   id: serial("id").primaryKey(),
   wallet: text("wallet").notNull(),
   commitment: text("commitment").notNull(),

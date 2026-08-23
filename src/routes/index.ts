@@ -14,6 +14,7 @@ import relayInfoRouter from "./relay-info";
 import developerRouter from "./developer";
 import mixRouter from "./mix";
 import baseVaultRouter from "./base-vault";
+import ethereumVaultRouter from "./ethereum-vault";
 
 const router: IRouter = Router();
 
@@ -32,5 +33,6 @@ router.use(relayInfoRouter);
 router.use(developerRouter);
 router.use(mixRouter);
 router.use(baseVaultRouter);
+router.use(ethereumVaultRouter);
 
 export default router;

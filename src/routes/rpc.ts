@@ -1,4 +1,8 @@
 import { Router, type IRouter } from "express";
+import {
+  getActiveSolanaProgramId,
+  getSolanaCluster,
+} from "../lib/solana-program";
 
 const router: IRouter = Router();
 
@@ -52,12 +56,9 @@ router.get("/rpc/devnet", (_req, res): void => {
 });
 
 // GET /rpc/cluster -- tells frontend which cluster is active and which program ID to use
-const PROGRAM_ID_DEVNET = "5gbaenRHg2YK6X8WMMQZevD55bJ7fvr4V8E8e1feDt5D";
-const PROGRAM_ID_MAINNET = "HyciDEYB9hXdmmLMexTHv2QYDaJmuZr1AF7sipBbVLLH";
-
 router.get("/rpc/cluster", (_req, res): void => {
-  const cluster = process.env.SOLANA_CLUSTER ?? "mainnet";
-  const programId = cluster === "devnet" ? PROGRAM_ID_DEVNET : PROGRAM_ID_MAINNET;
+  const cluster = getSolanaCluster();
+  const programId = getActiveSolanaProgramId();
   res.json({ cluster, programId });
 });
 

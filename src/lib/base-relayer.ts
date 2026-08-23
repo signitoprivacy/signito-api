@@ -15,22 +15,75 @@ const SHETH_ADDRESS = process.env.BASE_SHETH_ADDRESS as `0x${string}` | undefine
 const IS_MAINNET = process.env.BASE_NETWORK === "mainnet";
 const chain = IS_MAINNET ? base : baseSepolia;
 
-// Primary: BASE_RPC_URL (Alchemy). Fallback: public Base RPC if Alchemy fails.
-const BASE_PUBLIC_RPC = "https://mainnet.base.org";
+// Primary: BASE_RPC_URL (managed RPC when configured), followed by independent
+// public endpoints. A single public endpoint is not sufficient for Mainnet
+// status checks because it can throttle reads while the chain is healthy.
+const BASE_PUBLIC_RPCS = [
+  "https://mainnet.base.org",
+  "https://base-rpc.publicnode.com",
+  "https://1rpc.io/base",
+];
 const SEPOLIA_RPC = process.env.BASE_SEPOLIA_RPC_URL ?? "https://sepolia.base.org";
 const BASE_RPC_URL = process.env.BASE_RPC_URL;
+const BASE_RPC_FALLBACK_URL = process.env.BASE_RPC_FALLBACK_URL;
+const BASE_RECEIPT_POLL_INTERVAL_MS = 60_000;
 
 function makeTransport(isMainnet: boolean) {
-  if (isMainnet && BASE_RPC_URL) {
-    return fallback([http(BASE_RPC_URL), http(BASE_PUBLIC_RPC)]);
+  if (isMainnet) {
+    const urls = [BASE_RPC_URL, BASE_RPC_FALLBACK_URL, ...BASE_PUBLIC_RPCS]
+      .filter((url): url is string => !!url)
+      .filter((url, index, all) => all.indexOf(url) === index);
+    return fallback(
+      urls.map((url) => http(url, { retryCount: 1, retryDelay: 300 })),
+      { retryCount: 2, retryDelay: 250 },
+    );
   }
-  return http(isMainnet ? BASE_PUBLIC_RPC : SEPOLIA_RPC);
+  return http(SEPOLIA_RPC);
 }
 
 export const basePublicClient = createPublicClient({
   chain,
   transport: makeTransport(IS_MAINNET),
 });
+
+/**
+ * Poll a submitted Base transaction without treating an unavailable receipt as a
+ * failed transaction. A transaction hash is immutable: callers must reconcile
+ * that hash instead of submitting a replacement while its final status is unknown.
+ */
+export async function waitForBaseReceipt(hash: `0x${string}`) {
+  let attempt = 0;
+  for (;;) {
+    attempt += 1;
+    try {
+      return await basePublicClient.getTransactionReceipt({ hash });
+    } catch (error) {
+      logger.info(
+        { hash, attempt, nextPollMs: BASE_RECEIPT_POLL_INTERVAL_MS, error },
+        "Base transaction is pending; receipt status will be checked again",
+      );
+      await new Promise((resolve) => setTimeout(resolve, BASE_RECEIPT_POLL_INTERVAL_MS));
+    }
+  }
+}
+
+export async function withBaseRpcRetry<T>(
+  operation: () => Promise<T>,
+  attempts = 3,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
 
 export function getBaseWalletClient() {
   if (!RAW_KEY) throw new Error("BASE_RELAYER_PRIVATE_KEY not set");

@@ -15,6 +15,7 @@ import { Keypair, VersionedTransaction, Connection, PublicKey } from "@solana/we
 import bs58 from "bs58";
 import { logger } from "./logger.js";
 import { heliusRpcUrl } from "./rpc.js";
+import { getActiveSolanaProgramId } from "./solana-program.js";
 
 // ─── Keypair ────────────────────────────────────────────────────────────────
 
@@ -53,6 +54,98 @@ export function getRpcUrl(): string {
 
 export function getConnection(): Connection {
   return new Connection(heliusRpcUrl(), "confirmed");
+}
+
+const SOLANA_STATUS_POLL_INTERVAL_MS = 60_000;
+const SOLANA_STATUS_CACHE_TTL_MS = 60_000;
+
+export type SolanaSignatureStatus = {
+  confirmationStatus: "processed" | "confirmed" | "finalized" | null;
+  err: unknown | null;
+  slot: number | null;
+};
+
+const solanaSignatureStatusCache = new Map<
+  string,
+  { checkedAt: number; status: SolanaSignatureStatus | null }
+>();
+
+/**
+ * Read signature status at most once per signature per minute across API
+ * handlers and background reconcilers. UI polling can safely read the cached
+ * result without amplifying Solana RPC traffic.
+ */
+export async function getSolanaSignatureStatus(
+  connection: Connection,
+  signature: string,
+): Promise<SolanaSignatureStatus | null> {
+  const cached = solanaSignatureStatusCache.get(signature);
+  if (cached && Date.now() - cached.checkedAt < SOLANA_STATUS_CACHE_TTL_MS) {
+    return cached.status;
+  }
+
+  try {
+    const result = await connection.getSignatureStatuses(
+      [signature],
+      { searchTransactionHistory: true },
+    );
+    const raw = result.value[0];
+    const status = raw
+      ? {
+          confirmationStatus: raw.confirmationStatus ?? null,
+          err: raw.err ?? null,
+          slot: raw.slot ?? null,
+        }
+      : null;
+    solanaSignatureStatusCache.set(signature, { checkedAt: Date.now(), status });
+    return status;
+  } catch (error) {
+    if (cached) return cached.status;
+    throw error;
+  }
+}
+
+setInterval(() => {
+  const expiry = Date.now() - 10 * 60_000;
+  for (const [signature, cached] of solanaSignatureStatusCache) {
+    if (cached.checkedAt < expiry) solanaSignatureStatusCache.delete(signature);
+  }
+}, 60_000);
+
+/**
+ * Reconcile a submitted Solana signature. RPC outages and absent receipts are
+ * pending/unknown states, not a reason to submit a replacement transaction.
+ */
+export async function waitForSolanaSignature(
+  connection: Connection,
+  signature: string,
+): Promise<void> {
+  let attempt = 0;
+  for (;;) {
+    attempt += 1;
+    try {
+      const status = await getSolanaSignatureStatus(connection, signature);
+      if (status?.err) {
+        throw new Error(`Transaction failed on-chain: ${JSON.stringify(status.err)}`);
+      }
+      if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") {
+        return;
+      }
+      logger.info(
+        { signature, attempt, nextPollMs: SOLANA_STATUS_POLL_INTERVAL_MS },
+        "Solana transaction is pending; status will be checked again",
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("Transaction failed on-chain:")) {
+        throw error;
+      }
+      logger.warn(
+        { signature, attempt, nextPollMs: SOLANA_STATUS_POLL_INTERVAL_MS, error },
+        "Solana transaction status RPC unavailable; status will be checked again",
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, SOLANA_STATUS_POLL_INTERVAL_MS));
+  }
 }
 
 // ─── Rate Limiter ────────────────────────────────────────────────────────────
@@ -112,7 +205,7 @@ export const ALLOWED_PROGRAMS = new Set<string>([
   "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",  // Memo
   "Ed25519SigVerify111111111111111111111111111",    // Ed25519 precompile
   "5gbaenRHg2YK6X8WMMQZevD55bJ7fvr4V8E8e1feDt5D", // signito_vault (devnet)
-  "HyciDEYB9hXdmmLMexTHv2QYDaJmuZr1AF7sipBbVLLH", // signito_vault (mainnet)
+  getActiveSolanaProgramId(), // approved active signito_vault program
 ]);
 
 // ─── Max fee guard ────────────────────────────────────────────────────────────

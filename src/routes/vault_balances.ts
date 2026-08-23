@@ -3,11 +3,13 @@ import { db, vaultBalancesTable, vaultsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { PublicKey } from "@solana/web3.js";
 import { heliusRpcUrl } from "../lib/rpc";
+import { getActiveSolanaProgramId } from "../lib/solana-program";
 
 const router: IRouter = Router();
 
-const SIGNITO_VAULT_PROGRAM = "HyciDEYB9hXdmmLMexTHv2QYDaJmuZr1AF7sipBbVLLH";
-const PROGRAM_ID = new PublicKey(SIGNITO_VAULT_PROGRAM);
+function getProgramId() {
+  return new PublicKey(getActiveSolanaProgramId());
+}
 
 // Cache program deployment status so we don't hit RPC on every request
 let programDeployedCache: boolean | null = null;
@@ -25,7 +27,7 @@ async function checkProgramDeployed(): Promise<boolean> {
       body: JSON.stringify({
         jsonrpc: "2.0",
         method: "getAccountInfo",
-        params: [SIGNITO_VAULT_PROGRAM, { encoding: "base64" }],
+        params: [getActiveSolanaProgramId(), { encoding: "base64" }],
         id: 1,
       }),
       signal: AbortSignal.timeout(5000),
@@ -58,7 +60,7 @@ async function fetchOnchainUserState(
     const stokenAtaPk = new PublicKey(stokenAccount);
     const [userStatePda] = PublicKey.findProgramAddressSync(
       [Buffer.from("user_state"), stokenAtaPk.toBuffer()],
-      PROGRAM_ID,
+      getProgramId(),
     );
     const res = await fetch(heliusRpcUrl(), {
       method: "POST",

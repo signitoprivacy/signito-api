@@ -13,7 +13,7 @@ import { pgTable, text, serial, timestamp } from "drizzle-orm/pg-core";
 //
 // On-chain state is created ONLY when a real user action (shield/unshield/zksend)
 // occurs -- never upfront by the background worker. The worker only generates keypairs.
-export const mixWalletsTable = pgTable("mix_wallets", {
+export const mixWalletsTable = pgTable("solana_v4_mix_wallets", {
   id: serial("id").primaryKey(),
   stokenAta: text("stoken_ata").notNull().unique(),
   secretKey: text("secret_key"),                          // base64 secret key for stoken_ata keypair ("ready" only)

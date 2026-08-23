@@ -3,16 +3,21 @@ import { logger } from "./lib/logger";
 import { overrideProgramId } from "@workspace/program";
 import { startDepositWatcher } from "./routes/vault";
 import { startMixPoolWorker } from "./lib/mix-pool-worker";
+import {
+  getActiveSolanaProgramId,
+  getSolanaCluster,
+  SOLANA_DEVNET_PROGRAM_ID,
+} from "./lib/solana-program";
 
 // Switch program ID based on cluster so devnet (old program) and mainnet (new program)
 // both work from the same codebase without rebuilding.
-const PROGRAM_ID_DEVNET = "5gbaenRHg2YK6X8WMMQZevD55bJ7fvr4V8E8e1feDt5D";
-const PROGRAM_ID_MAINNET = "HyciDEYB9hXdmmLMexTHv2QYDaJmuZr1AF7sipBbVLLH";
-const activeCluster = process.env.SOLANA_CLUSTER ?? "mainnet";
+const PROGRAM_ID_MAINNET = getActiveSolanaProgramId();
+const activeCluster = getSolanaCluster();
 if (activeCluster === "devnet") {
-  overrideProgramId(PROGRAM_ID_DEVNET);
-  logger.info({ programId: PROGRAM_ID_DEVNET }, "Using devnet program ID");
+  overrideProgramId(SOLANA_DEVNET_PROGRAM_ID);
+  logger.info({ programId: SOLANA_DEVNET_PROGRAM_ID }, "Using devnet program ID");
 } else {
+  overrideProgramId(PROGRAM_ID_MAINNET);
   logger.info({ programId: PROGRAM_ID_MAINNET }, "Using mainnet program ID");
 }
 

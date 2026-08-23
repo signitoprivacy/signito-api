@@ -19,7 +19,12 @@ import {
   fetchPoolState,
   fetchUserState,
 } from "@workspace/program";
-import { getConnection, relayerKeypair } from "../lib/relayer.js";
+import {
+  getConnection,
+  getSolanaSignatureStatus,
+  relayerKeypair,
+  waitForSolanaSignature,
+} from "../lib/relayer.js";
 import { getSolPriceUsd } from "../lib/sol-price.js";
 import { logger } from "../lib/logger.js";
 
@@ -759,17 +764,7 @@ router.post("/vault/confirm-shield", async (req, res): Promise<void> => {
     // Background: poll confirmation then persist vault record
     void (async () => {
       try {
-        const bgDeadline = Date.now() + 90_000;
-        while (Date.now() < bgDeadline) {
-          const statuses = await conn.getSignatureStatuses([txSig], { searchTransactionHistory: true });
-          const s = statuses.value[0];
-          if (s?.err) {
-            req.log.warn({ txSig, err: s.err }, "confirm-shield bg: tx failed on-chain");
-            return; // pending record stays for debugging
-          }
-          if (s?.confirmationStatus === "confirmed" || s?.confirmationStatus === "finalized") break;
-          await new Promise((r) => setTimeout(r, 1500));
-        }
+        await waitForSolanaSignature(conn, txSig);
 
         await deletePendingShield(id);
 
@@ -859,9 +854,7 @@ router.get("/vault/shield-status", async (req, res): Promise<void> => {
   }
 
   try {
-    const conn = getConnection();
-    const statuses = await conn.getSignatureStatuses([sig], { searchTransactionHistory: true });
-    const s = statuses.value[0];
+    const s = await getSolanaSignatureStatus(getConnection(), sig);
 
     let vaultSaved = false;
     if (wallet) {
@@ -1509,18 +1502,7 @@ router.post("/vault/unshield", async (req, res): Promise<void> => {
 
     req.log.info({ wallet, tx1Sig }, "unshield 1TX: burn broadcast, confirming...");
 
-    const deadline = Date.now() + 90_000;
-    while (Date.now() < deadline) {
-      const statuses = await conn.getSignatureStatuses([tx1Sig], { searchTransactionHistory: true });
-      const s = statuses.value[0];
-      if (s?.err) {
-        req.log.warn({ tx1Sig, err: s.err }, "unshield 2TX: TX1 failed on-chain");
-        res.status(400).json({ error: "Burn transaction failed on-chain" });
-        return;
-      }
-      if (s?.confirmationStatus === "confirmed" || s?.confirmationStatus === "finalized") break;
-      await new Promise((r) => setTimeout(r, 1500));
-    }
+    await waitForSolanaSignature(conn, tx1Sig);
 
     req.log.info({ wallet, tx1Sig }, "unshield 2TX: TX1 confirmed");
 
@@ -1623,13 +1605,15 @@ router.post("/vault/prepare-refresh", async (req, res): Promise<void> => {
       const verifyConn = getConnection();
       const verifyAtaPk = new PublicKey(vault.stokenAccount);
       const onchainState = await fetchUserState(verifyConn, verifyAtaPk);
-      if (onchainState) {
-        const computed = sha256Hex(otsPreimage);
-        const onchainTip = Buffer.from(onchainState.currentOtsHash).toString("hex");
-        if (computed !== onchainTip) {
-          res.status(401).json({ error: "Current vault code incorrect." });
-          return;
-        }
+      if (!onchainState) {
+        res.status(400).json({ error: "On-chain vault state not found. Cannot verify vault code." });
+        return;
+      }
+      const computed = sha256Hex(otsPreimage);
+      const onchainTip = Buffer.from(onchainState.currentOtsHash).toString("hex");
+      if (computed !== onchainTip) {
+        res.status(401).json({ error: "Current vault code incorrect." });
+        return;
       }
     } catch (verifyErr) {
       req.log.warn({ verifyErr }, "prepare-refresh: on-chain OTS verify failed (RPC error), rejecting to be safe");

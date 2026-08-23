@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { eq, and, isNull } from "drizzle-orm";
+import { eq, and, desc, inArray, isNull } from "drizzle-orm";
 import { randomBytes } from "crypto";
 import { db, baseVaultsTable, baseStealthPendingTable, baseMixWalletsTable } from "@workspace/db";
 import {
@@ -10,6 +10,8 @@ import {
   getShETHAddress,
   getRelayerAddress,
   basePublicClient,
+  waitForBaseReceipt,
+  withBaseRpcRetry,
   POOL_ABI,
   SHETH_ABI,
 } from "../lib/base-relayer.js";
@@ -18,6 +20,7 @@ import { logger } from "../lib/logger.js";
 const router = Router();
 
 const DECOY_COUNT = 20;
+const provisioningByVault = new Map<string, Promise<void>>();
 
 // Generate a random Ethereum-style address (hex, not a real wallet -- used for decoy addresses).
 function randomAddress(): `0x${string}` {
@@ -40,9 +43,10 @@ function shuffleArray<T>(arr: T[]): T[] {
 async function spawnDecoys(
   linkedStokenAddress: string,
   amount: bigint,
-  log: (msg: string, data?: object) => void
+  log: (msg: string, data?: object) => void,
+  count = DECOY_COUNT,
 ): Promise<void> {
-  const fakeAddresses: `0x${string}`[] = Array.from({ length: DECOY_COUNT }, randomAddress);
+  const fakeAddresses: `0x${string}`[] = Array.from({ length: count }, randomAddress);
   const MAX_ATTEMPTS = 3;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -57,9 +61,9 @@ async function spawnDecoys(
         args: [fakeAddresses, amount],
         account,
       });
-      log("batchAdminMint submitted", { mintHash, linkedStokenAddress, count: DECOY_COUNT, attempt });
+      log("batchAdminMint submitted", { mintHash, linkedStokenAddress, count, attempt });
 
-      await basePublicClient.waitForTransactionReceipt({ hash: mintHash, timeout: 60_000 });
+      await waitForBaseReceipt(mintHash);
       log("batchAdminMint confirmed", { mintHash, attempt });
 
       await db.insert(baseMixWalletsTable).values(
@@ -81,7 +85,46 @@ async function spawnDecoys(
     }
   }
 
-  log("batchAdminMint failed after all attempts (non-fatal, reduced anonymity set)", { linkedStokenAddress });
+  throw new Error("Base privacy-set preparation failed after three relayer attempts.");
+}
+
+async function getUsableDecoys(linkedStokenAddress: string, amount: bigint) {
+  const rows = await db
+    .select()
+    .from(baseMixWalletsTable)
+    .where(and(
+      eq(baseMixWalletsTable.linkedStokenAddress, linkedStokenAddress),
+      eq(baseMixWalletsTable.status, "ready"),
+    ));
+  return rows.filter((row) => BigInt(row.mintedAmount) >= amount);
+}
+
+async function ensurePrivacySet(
+  linkedStokenAddress: string,
+  amount: bigint,
+  log: (message: string, data?: object) => void,
+): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const ready = await getUsableDecoys(linkedStokenAddress, amount);
+    const missing = DECOY_COUNT - ready.length;
+    if (missing <= 0) return;
+
+    const existing = provisioningByVault.get(linkedStokenAddress);
+    if (existing) {
+      await existing;
+      continue;
+    }
+
+    const job = spawnDecoys(linkedStokenAddress, amount, log, missing);
+    provisioningByVault.set(linkedStokenAddress, job);
+    try {
+      await job;
+    } finally {
+      provisioningByVault.delete(linkedStokenAddress);
+    }
+  }
+
+  throw new Error("Base privacy-set preparation did not reach 20 funded decoys.");
 }
 
 // GET /base/status
@@ -91,16 +134,17 @@ router.get("/base/status", async (req, res) => {
   }
   try {
     const poolAddress = getPoolAddress();
-    const [poolBalance, totalSupply] = await Promise.all([
+    const [poolBalance, totalSupply] = await withBaseRpcRetry(() => Promise.all([
       basePublicClient.getBalance({ address: poolAddress }),
       basePublicClient.readContract({
         address: getShETHAddress(),
         abi: SHETH_ABI,
         functionName: "totalSupply",
       }),
-    ]);
+    ]));
     return res.json({
       enabled: true,
+      available: true,
       poolAddress,
       sethAddress: getShETHAddress(),
       relayerAddress: getRelayerAddress(),
@@ -110,7 +154,13 @@ router.get("/base/status", async (req, res) => {
     });
   } catch (err) {
     req.log.error({ err }, "base/status error");
-    return res.status(500).json({ error: "rpc error" });
+    return res.status(503).json({
+      enabled: true,
+      available: false,
+      error: "Base RPC temporarily unavailable",
+      retryable: true,
+      network: process.env.BASE_NETWORK ?? "sepolia",
+    });
   }
 });
 
@@ -123,12 +173,22 @@ router.get("/base/vault/state/:stokenAddress", async (req, res) => {
     return res.status(400).json({ error: "invalid address" });
   }
   try {
-    const result = await basePublicClient.readContract({
-      address: getPoolAddress(),
-      abi: POOL_ABI,
-      functionName: "getUserState",
-      args: [stokenAddress as `0x${string}`],
-    });
+    let result: readonly [string, number, bigint, boolean] | undefined;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      result = await withBaseRpcRetry(() => basePublicClient.readContract({
+        address: getPoolAddress(),
+        abi: POOL_ABI,
+        functionName: "getUserState",
+        args: [stokenAddress as `0x${string}`],
+      }));
+      // A just-confirmed shield can be visible on one RPC before another.
+      // Retry the valid-but-stale default state before returning it.
+      if (result[3] || attempt === 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+    if (!result) {
+      throw new Error("Base RPC returned no vault state");
+    }
     return res.json({
       currentOtsHash: result[0],
       chainDepth: result[1],
@@ -137,7 +197,10 @@ router.get("/base/vault/state/:stokenAddress", async (req, res) => {
     });
   } catch (err) {
     req.log.error({ err }, "getUserState error");
-    return res.status(500).json({ error: "rpc error" });
+    return res.status(503).json({
+      error: "Base RPC temporarily unavailable",
+      retryable: true,
+    });
   }
 });
 
@@ -232,6 +295,21 @@ router.get("/base/vault/vaults/:wallet", async (req, res) => {
   return res.json(rows);
 });
 
+// Readiness is intentionally limited to anonymous capacity information. It never
+// exposes decoy addresses or relayer credentials.
+router.get("/base/vault/readiness/:stokenAddress", async (req, res): Promise<void> => {
+  const { stokenAddress } = req.params;
+  const amount = typeof req.query.amount === "string" && /^\d+$/.test(req.query.amount)
+    ? BigInt(req.query.amount)
+    : 0n;
+  if (!/^0x[0-9a-fA-F]{40}$/.test(stokenAddress)) {
+    res.status(400).json({ error: "invalid address" });
+    return;
+  }
+  const readyDecoys = (await getUsableDecoys(stokenAddress, amount)).length;
+  res.json({ ready: readyDecoys >= DECOY_COUNT, readyDecoys, requiredDecoys: DECOY_COUNT });
+});
+
 // POST /base/vault/unshield
 // User sends OTS preimage + recipient off-chain. Relayer calls burnAndQueue (all 21 accounts) then processQueue.
 // OTS preimage never appears in public mempool -- all TXs submitted via Flashbots on mainnet.
@@ -244,43 +322,56 @@ router.post("/base/vault/unshield", async (req, res) => {
     otsPreimage: z.string().regex(/^0x[0-9a-fA-F]{64}$/),
     amount: z.string().regex(/^\d+$/),
     recipient: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
+    action: z.enum(["unshield", "zk-send"]).default("unshield"),
   });
 
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
-  const { stokenAddress, wallet, otsPreimage, amount, recipient } = parsed.data;
+  const { stokenAddress, wallet, otsPreimage, amount, recipient, action } = parsed.data;
   const amountBig = BigInt(amount);
   const stokenAddr = stokenAddress as `0x${string}`;
   const recipientAddr = recipient as `0x${string}`;
   const preimageHex = otsPreimage as `0x${string}`;
-
-  const [pending] = await db
-    .insert(baseStealthPendingTable)
-    .values({ wallet, stokenAddress, amount, recipient, status: "pending" })
-    .returning();
+  let pendingId: number | undefined;
+  let decoysLocked = false;
+  let transactionBroadcast = false;
+  let decoyIds: number[] = [];
 
   try {
     const { client, account } = getBaseWalletClient();
     const poolAddress = getPoolAddress();
 
-    // Fetch the 20 decoys linked to this stokenAddress that are still ready to burn.
-    const decoyRows = await db
-      .select()
-      .from(baseMixWalletsTable)
-      .where(
-        and(
-          eq(baseMixWalletsTable.linkedStokenAddress, stokenAddress),
-          eq(baseMixWalletsTable.status, "ready")
-        )
+    const [pending] = await db
+      .insert(baseStealthPendingTable)
+      .values({ wallet, stokenAddress, amount, recipient, action, status: "pending" })
+      .returning();
+    pendingId = pending.id;
+
+    let usableDecoys = await getUsableDecoys(stokenAddress, amountBig);
+    if (usableDecoys.length < DECOY_COUNT) {
+      await db
+        .update(baseStealthPendingTable)
+        .set({ status: "provisioning", error: null })
+        .where(eq(baseStealthPendingTable.id, pending.id));
+      req.log.info(
+        { stokenAddress, readyDecoys: usableDecoys.length, requiredDecoys: DECOY_COUNT, action },
+        "preparing Base privacy set",
       );
+      await ensurePrivacySet(stokenAddress, amountBig, (message, data) => req.log.info(data ?? {}, message));
+      usableDecoys = await getUsableDecoys(stokenAddress, amountBig);
+    }
+    if (usableDecoys.length < DECOY_COUNT) {
+      throw new Error("Base privacy-set preparation did not reach 20 funded decoys.");
+    }
 
-    // Filter to decoys that have enough balance to cover this burn amount.
-    const usableDecoys = decoyRows.filter(
-      (d) => BigInt(d.mintedAmount) >= amountBig
-    );
-
-    const decoyAddresses = usableDecoys.map((d) => d.stokenAddress as `0x${string}`);
+    const selectedDecoys = usableDecoys.slice(0, DECOY_COUNT);
+    const decoyAddresses = selectedDecoys.map((d) => d.stokenAddress as `0x${string}`);
+    decoyIds = selectedDecoys.map((d) => d.id);
+    await db
+      .update(baseStealthPendingTable)
+      .set({ status: "pending", error: null })
+      .where(eq(baseStealthPendingTable.id, pending.id));
 
     req.log.info(
       { stokenAddress, decoyCount: decoyAddresses.length },
@@ -288,16 +379,15 @@ router.post("/base/vault/unshield", async (req, res) => {
     );
 
     // Mark decoys as burning before TX to prevent double-use.
-    if (decoyAddresses.length > 0) {
+    if (decoyIds.length > 0) {
       await db
         .update(baseMixWalletsTable)
         .set({ status: "burning" })
-        .where(
-          and(
-            eq(baseMixWalletsTable.linkedStokenAddress, stokenAddress),
-            eq(baseMixWalletsTable.status, "ready")
-          )
-        );
+        .where(and(
+          inArray(baseMixWalletsTable.id, decoyIds),
+          eq(baseMixWalletsTable.status, "ready"),
+        ));
+      decoysLocked = true;
     }
 
     // TX1: burnAndQueue
@@ -317,6 +407,7 @@ router.post("/base/vault/unshield", async (req, res) => {
       args: [amountBig, preimageHex, allBurnAccounts],
       account,
     });
+    transactionBroadcast = true;
     req.log.info({ burnHash, totalAccounts: allBurnAccounts.length }, "burnAndQueue submitted");
 
     await db
@@ -324,23 +415,18 @@ router.post("/base/vault/unshield", async (req, res) => {
       .set({ burnTxHash: burnHash, status: "burned" })
       .where(eq(baseStealthPendingTable.id, pending.id));
 
-    const receipt1 = await basePublicClient.waitForTransactionReceipt({
-      hash: burnHash,
-      timeout: 60_000,
-    });
+    const receipt1 = await waitForBaseReceipt(burnHash);
 
     if (receipt1.status !== "success") {
       // Restore decoys to ready if burn failed so they can be retried.
-      if (decoyAddresses.length > 0) {
+      if (decoyIds.length > 0) {
         await db
           .update(baseMixWalletsTable)
           .set({ status: "ready" })
-          .where(
-            and(
-              eq(baseMixWalletsTable.linkedStokenAddress, stokenAddress),
-              eq(baseMixWalletsTable.status, "burning")
-            )
-          );
+          .where(and(
+            inArray(baseMixWalletsTable.id, decoyIds),
+            eq(baseMixWalletsTable.status, "burning"),
+          ));
       }
       await db
         .update(baseStealthPendingTable)
@@ -350,16 +436,14 @@ router.post("/base/vault/unshield", async (req, res) => {
     }
 
     // Mark decoys as burned after confirmed TX.
-    if (decoyAddresses.length > 0) {
+    if (decoyIds.length > 0) {
       await db
         .update(baseMixWalletsTable)
         .set({ status: "burned" })
-        .where(
-          and(
-            eq(baseMixWalletsTable.linkedStokenAddress, stokenAddress),
-            eq(baseMixWalletsTable.status, "burning")
-          )
-        );
+        .where(and(
+          inArray(baseMixWalletsTable.id, decoyIds),
+          eq(baseMixWalletsTable.status, "burning"),
+        ));
     }
 
     // TX2: processQueue -- separate TX, zero accounts in common with TX1.
@@ -376,17 +460,26 @@ router.post("/base/vault/unshield", async (req, res) => {
       args: [recipientAddr, amountBig],
       account,
     });
+    transactionBroadcast = true;
     req.log.info({ processHash }, "processQueue submitted");
 
     await db
       .update(baseStealthPendingTable)
-      .set({ processTxHash: processHash, status: "processed" })
+      .set({ processTxHash: processHash, status: "processing" })
       .where(eq(baseStealthPendingTable.id, pending.id));
 
-    await basePublicClient.waitForTransactionReceipt({
-      hash: processHash,
-      timeout: 60_000,
-    });
+    const processReceipt = await waitForBaseReceipt(processHash);
+    if (processReceipt.status !== "success") {
+      await db
+        .update(baseStealthPendingTable)
+        .set({ status: "failed", error: "processQueue reverted on-chain" })
+        .where(eq(baseStealthPendingTable.id, pending.id));
+      return res.status(500).json({ error: "processQueue reverted on-chain" });
+    }
+    await db
+      .update(baseStealthPendingTable)
+      .set({ status: "processed" })
+      .where(eq(baseStealthPendingTable.id, pending.id));
 
     return res.json({
       burnTxHash: burnHash,
@@ -394,12 +487,30 @@ router.post("/base/vault/unshield", async (req, res) => {
       totalBurned: allBurnAccounts.length,
     });
   } catch (err) {
+    const message = String(err instanceof Error ? err.message : err);
     req.log.error({ err }, "unshield error");
-    await db
-      .update(baseStealthPendingTable)
-      .set({ status: "failed" })
-      .where(eq(baseStealthPendingTable.id, pending.id));
-    return res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
+    if (pendingId) {
+      await db
+        .update(baseStealthPendingTable)
+        .set({
+          status: transactionBroadcast ? "unknown" : "failed",
+          error: message,
+        })
+        .where(eq(baseStealthPendingTable.id, pendingId));
+    }
+    // Never release decoys after any transaction hash was returned. A receipt
+    // timeout is unknown state, not a safe retry condition.
+    if (!transactionBroadcast && decoysLocked) {
+      await db
+        .update(baseMixWalletsTable)
+        .set({ status: "ready" })
+        .where(and(
+          inArray(baseMixWalletsTable.id, decoyIds),
+          eq(baseMixWalletsTable.status, "burning"),
+        ));
+    }
+    res.status(500).json({ error: message });
+    return;
   }
 });
 
@@ -410,7 +521,7 @@ router.get("/base/vault/history/:wallet", async (req, res) => {
     .select()
     .from(baseStealthPendingTable)
     .where(eq(baseStealthPendingTable.wallet, wallet))
-    .orderBy(baseStealthPendingTable.createdAt);
+    .orderBy(desc(baseStealthPendingTable.createdAt));
   return res.json(rows);
 });
 
@@ -450,7 +561,7 @@ router.post("/base/vault/refresh-ots", async (req, res) => {
     });
 
     req.log.info({ hash, stokenAddress }, "refreshOts submitted");
-    await basePublicClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+    await waitForBaseReceipt(hash);
     req.log.info({ hash, stokenAddress }, "refreshOts confirmed");
 
     return res.json({ ok: true, txHash: hash });
@@ -502,7 +613,7 @@ async function recoverStuckTransactions(): Promise<void> {
         });
 
         logger.info({ processHash, id: row.id, recipient: row.recipient }, "recovery: processQueue submitted");
-        await basePublicClient.waitForTransactionReceipt({ hash: processHash, timeout: 60_000 });
+        await waitForBaseReceipt(processHash);
 
         await db
           .update(baseStealthPendingTable)
